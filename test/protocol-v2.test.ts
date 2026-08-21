@@ -1,0 +1,176 @@
+import { createHash, createPublicKey, verify } from 'node:crypto';
+
+import AgentGuardClient, {
+  createDpopProof,
+  generateRsaProofKey,
+} from '../index';
+
+function decodePart(value: string): Record<string, any> {
+  return JSON.parse(Buffer.from(value, 'base64url').toString('utf8'));
+}
+
+describe('AgenticDome protocol v2', () => {
+  test('preserves a human subject and nested agent actors together', async () => {
+    const client = new AgentGuardClient('https://sidecar.example', {
+      apiKey: 'test-key',
+      tenantId: 'tenant-1',
+    });
+    const request = jest.fn().mockResolvedValue({ verdict: 'ALLOWED' });
+    (client as any).request = request;
+
+    await client.guardrailValidate({
+      text: 'send approved invoice',
+      agentId: 'worker-agent',
+      sourceAgentId: 'manager-agent',
+      userId: 'alice',
+      sourcePlatform: 'langgraph',
+      platform: 'pydanticai',
+      direction: 'outbound',
+    });
+
+    const payload = request.mock.calls[0][2].jsonBody;
+    expect(payload.user_id).toBe('alice');
+    expect(payload.source_agent_id).toBe('manager-agent');
+    expect(payload.policy_context.agenticdome_identity.subject.id).toBe('alice');
+    expect(payload.policy_context.agenticdome_identity.actors.map((actor: any) => actor.id)).toEqual([
+      'manager-agent',
+      'worker-agent',
+    ]);
+    client.close();
+  });
+
+  test('propagates lineage, policy, proof, and atomic consumption fields', async () => {
+    const client = new AgentGuardClient('https://sidecar.example', { apiKey: 'test-key' });
+    const request = jest.fn().mockResolvedValue({ result: { verdict: 'ALLOWED' } });
+    (client as any).request = request;
+
+    await client.a2aAuthorizeTool({
+      text: 'issue refund',
+      agentId: 'refund-worker',
+      sourceAgentId: 'manager',
+      userId: 'alice',
+      sourcePlatform: 'langgraph',
+      platform: 'pydanticai',
+      toolName: 'refund.create',
+      toolArgs: { amount: 25 },
+      actorChain: [{ id: 'planner', framework: 'crewai' }],
+      scopes: ['refund:create'],
+      parentJti: 'parent-token',
+      rootJti: 'root-token',
+      policyId: 'refund-policy',
+      policyVersion: '4',
+      policyHash: 'sha256:policy',
+      proofThumbprint: 'proof-thumbprint',
+    });
+
+    const authorizeArgs = request.mock.calls[0][2].jsonBody.params.arguments;
+    expect(authorizeArgs.user_id).toBe('alice');
+    expect(authorizeArgs.actor_chain).toEqual([{ id: 'planner', framework: 'crewai' }]);
+    expect(authorizeArgs.root_jti).toBe('root-token');
+    expect(authorizeArgs.proof_thumbprint).toBe('proof-thumbprint');
+
+    request.mockClear();
+    await client.a2aVerifyDecisionToken('decision-token', {
+      agentId: 'refund-worker',
+      sourceAgentId: 'manager',
+      userId: 'alice',
+      sessionId: 'session-1',
+      proofToken: 'signed-proof',
+    });
+    expect(request.mock.calls[0][2].jsonBody).toMatchObject({
+      user_id: 'alice',
+      session_id: 'session-1',
+      proof_token: 'signed-proof',
+      consume: true,
+    });
+    client.close();
+  });
+
+  test('creates a verifiable RS256 DPoP proof bound to method, URI, and token', () => {
+    const key = generateRsaProofKey();
+    const token = createDpopProof({
+      privateKeyPem: key.privateKeyPem,
+      accessToken: 'decision-token',
+      method: 'POST',
+      uri: '/a2a/decision/verify',
+      proofJti: 'proof-1',
+      issuedAt: 1234,
+    });
+    const [encodedHeader, encodedPayload, encodedSignature] = token.split('.');
+    const header = decodePart(encodedHeader);
+    const payload = decodePart(encodedPayload);
+
+    expect(header.typ).toBe('dpop+jwt');
+    expect(payload).toMatchObject({
+      jti: 'proof-1',
+      iat: 1234,
+      htm: 'POST',
+      htu: '/a2a/decision/verify',
+    });
+    expect(payload.ath).toBe(createHash('sha256').update('decision-token').digest('base64url'));
+    expect(verify(
+      'RSA-SHA256',
+      Buffer.from(`${encodedHeader}.${encodedPayload}`),
+      createPublicKey(key.privateKeyPem),
+      Buffer.from(encodedSignature, 'base64url'),
+    )).toBe(true);
+  });
+
+  test('routes tool authorization through the one-request broker in enforce mode', async () => {
+    const client = new AgentGuardClient('https://sidecar.example', {
+      apiKey: 'test-key',
+      tenantId: 'tenant-1',
+      executionBrokerMode: 'enforce',
+    });
+    const request = jest.fn().mockResolvedValue({
+      verdict: 'ALLOWED',
+      execution_receipt: 'signed-receipt',
+      broker: { verified: true, token_consumed: true },
+    });
+    (client as any).request = request;
+
+    const result = await client.guardrailValidate({
+      text: 'lookup customer',
+      agentId: 'support-agent',
+      platform: 'custom_python',
+      toolName: 'crm.lookup',
+      toolArgs: { id: '123' },
+      toolVersion: '1.2.3',
+      toolDigest: `sha256:${'a1'.repeat(32)}`,
+      executionDestination: 'https://crm.example.test/customers/123',
+      executionHttpMethod: 'GET',
+      workloadId: 'spiffe://customer.test/agent/support',
+    });
+
+    expect(request.mock.calls).toHaveLength(1);
+    expect(request.mock.calls[0][1]).toBe('/tools/execution/authorize');
+    expect(request.mock.calls[0][2].jsonBody.boundary_id).toMatch(/^sdk:/);
+    expect(request.mock.calls[0][2].jsonBody.tool_version).toBe('1.2.3');
+    expect(request.mock.calls[0][2].jsonBody.destination).toBe('https://crm.example.test/customers/123');
+    expect(request.mock.calls[0][2].jsonBody.http_method).toBe('GET');
+    expect(request.mock.calls[0][2].jsonBody.workload_id).toBe('spiffe://customer.test/agent/support');
+    expect(client.enforcementHeaders(result, 'spiffe://customer.test/agent/support')).toEqual({
+      'X-AgenticDome-Execution-Receipt': 'signed-receipt',
+      'X-AgenticDome-Workload-Id': 'spiffe://customer.test/agent/support',
+    });
+    client.close();
+  });
+
+  test('fails closed when an enforced broker receipt is missing', async () => {
+    const client = new AgentGuardClient('https://sidecar.example', {
+      apiKey: 'test-key',
+      tenantId: 'tenant-1',
+      executionBrokerMode: 'enforce',
+    });
+    (client as any).request = jest.fn().mockResolvedValue({ verdict: 'ALLOWED' });
+
+    await expect(client.guardrailValidate({
+      text: 'lookup customer',
+      agentId: 'support-agent',
+      platform: 'custom_python',
+      toolName: 'crm.lookup',
+      toolArgs: { id: '123' },
+    })).rejects.toThrow('atomically consumed');
+    client.close();
+  });
+});

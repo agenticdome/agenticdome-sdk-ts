@@ -1,17 +1,22 @@
 # AgenticDome SDK
 
 [![npm version](https://img.shields.io/npm/v/agenticdome-sdk.svg)](https://www.npmjs.com/package/agenticdome-sdk)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![CI](https://github.com/agenticdome/agenticdome-sdk-ts/actions/workflows/ci.yml/badge.svg)](https://github.com/agenticdome/agenticdome-sdk-ts/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 
 > **TypeScript SDK for AgenticDome AI security, guardrails, agent trust, delegation authorization, MCP/A2A security, and enterprise SaaS risk scanning.**
 
-`agenticdome-sdk` is the core TypeScript client library used to call the AgenticDome cloud governance plane from custom applications, middleware, OpenClaw plugins, MCP servers, A2A runtimes, AI gateways, and enterprise agent platforms.
+[MCP Gateway Integration Guide](https://github.com/agenticdome/agenticdome-sdk-ts/blob/main/docs/mcp-integration.md) · [Issue tracker](https://github.com/agenticdome/agenticdome-sdk-ts/issues) · [Security policy](https://github.com/agenticdome/agenticdome-sdk-ts/blob/main/SECURITY.md)
+
+`agenticdome-sdk` is the core TypeScript client library used to call a tenant's assigned AgenticDome runtime sidecar from custom applications, middleware, OpenClaw plugins, MCP servers, A2A runtimes, AI gateways, and enterprise agent platforms. The control plane distributes signed policy and governance state to that sidecar and is not called for every protected action.
 
 It provides a typed API client for:
 
 - Prompt and response guardrail validation
 - Tool and skill authorization
 - Multi-agent A2A decision-token verification
+- Canonical human-subject and nested agent-actor lineage
+- Single-use token consumption, lineage revocation, and RS256 proof-of-possession
 - MCP guardrail tool calls
 - Mesh output validation and DLP workflows
 - Agent risk and trust scoring
@@ -25,12 +30,23 @@ It provides a typed API client for:
 
 AgenticDome operates on a **hybrid split-plane model**.
 
-Your local agent runtime, application, OpenClaw gateway, MCP server, or custom middleware performs execution locally. The AgenticDome cloud governance plane provides centralized policy decisions, tenant configuration, API-key authentication, and security analytics.
+Your local agent runtime, application, OpenClaw gateway, MCP server, or custom middleware performs execution locally. The tenant's assigned AgenticDome runtime sidecar authenticates and evaluates live SDK requests. The management control plane distributes tenant configuration to that sidecar out of band and is not the per-action SDK endpoint.
+
+For the managed service, AgenticDome assigns a sidecar in the customer's
+selected supported geographic region, subject to availability and plan or
+contract. Under a Sovereign deployment, the runtime is deployed inside the
+contracted customer-controlled boundary, such as a dedicated VPC, customer
+cloud, or on-premises environment. The SDK does not select the location; it
+connects to the tenant-specific API base supplied during onboarding.
+
+This TypeScript client does not require customers to install Redis. Any backing
+services used by an AgenticDome-managed sidecar are operated as part of that
+runtime and are separate from the SDK application.
 
 ```text
-[ Local Runtime / App / Middleware ]              [ Cloud Governance Plane ]
+[ Local Runtime / App / Middleware ]              [ Assigned Runtime Sidecar ]
 ┌────────────────────────────────────┐            ┌────────────────────────┐
-│ • Custom AI apps                   │  HTTPS/RPC │ • au.agenticdome.io    │
+│ • Custom AI apps                   │  HTTPS/RPC │ • Tenant policy        │
 │ • OpenClaw plugins                 │───────────>│ • Centralized Rules    │
 │ • MCP / A2A gateways               │<───────────│ • Threat Analytics     │
 │ • Enterprise automation scripts    │  Verdict   │ • Tenant Governance    │
@@ -81,10 +97,10 @@ export AGENTGUARD_API_KEY="your_api_key_abc123..."
 export AGENTGUARD_TENANT_ID="your_tenant_id_xyz789..."
 ```
 
-Then pass the regional API base URL when constructing the client:
+Then pass the tenant's assigned runtime sidecar URL when constructing the client:
 
 ```ts
-const client = new AgentGuardClient('https://au.agenticdome.io');
+const client = new AgentGuardClient('https://your-assigned-sidecar.example');
 ```
 
 ### Optional Environment Variables
@@ -107,7 +123,7 @@ export AGENTGUARD_TENANT_ID="your_tenant_id"
 ```ts
 import AgentGuardClient from 'agenticdome-sdk';
 
-const client = new AgentGuardClient('https://au.agenticdome.io', {
+const client = new AgentGuardClient('https://your-assigned-sidecar.example', {
   apiKey: process.env.AGENTGUARD_API_KEY,
   tenantId: process.env.AGENTGUARD_TENANT_ID
 });
@@ -160,7 +176,7 @@ Use `guardrailValidate` to inspect inbound prompts, outbound responses, or tool 
 ```ts
 import AgentGuardClient from 'agenticdome-sdk';
 
-const client = new AgentGuardClient('https://au.agenticdome.io', {
+const client = new AgentGuardClient('https://your-assigned-sidecar.example', {
   apiKey: process.env.AGENTGUARD_API_KEY,
   tenantId: process.env.AGENTGUARD_TENANT_ID
 });
@@ -226,6 +242,40 @@ const result = await client.guardrailValidate({
 console.log(result);
 ```
 
+### Brokered execution and the enforcement gateway
+
+For protected tools, set broker mode to `enforce`, bind the decision to the real destination/method/tool digest/workload, and add the returned one-use receipt to the actual outbound request:
+
+```ts
+const client = new AgentGuardClient('https://your-sidecar.example.com', {
+  apiKey: process.env.AGENTGUARD_API_KEY,
+  tenantId: process.env.AGENTGUARD_TENANT_ID,
+  executionBrokerMode: 'enforce'
+});
+
+const decision = await client.guardrailValidate({
+  text: 'Read customer account',
+  direction: 'outbound',
+  agentId: 'support-agent-1',
+  platform: 'mcp',
+  toolName: 'crm.lookup',
+  toolArgs: { customer_id: '123' },
+  toolVersion: '1.4.2',
+  toolDigest: `sha256:${'a'.repeat(64)}`,
+  executionDestination: 'https://crm.example.com/customers/123',
+  executionHttpMethod: 'GET',
+  workloadId: 'spiffe://customer.example/agent/support-agent-1'
+});
+
+const headers = client.enforcementHeaders(
+  decision,
+  'spiffe://customer.example/agent/support-agent-1'
+);
+// Merge headers into the real fetch/HTTP request routed through the gateway.
+```
+
+The control-plane website, provenance registry, SBOM registry, and LLM are not called on this hot path. Approved bundles are cached in the sidecar. Framework/plugin wrappers share the core client, but the application must still place the receipt on the final external request; generating a receipt without enforcing that boundary is not interception.
+
 ---
 
 ## A2A Tool Authorization
@@ -239,6 +289,7 @@ const authorization = await client.a2aAuthorizeTool({
   text: 'Manager delegates Salesforce account update to specialist',
   agentId: 'salesforce-specialist-01',
   sourceAgentId: 'manager-agent-01',
+  userId: 'originating-user-01',
   platform: 'openclaw',
   sourcePlatform: 'openclaw',
   toolPlatform: 'salesforce',
@@ -248,6 +299,16 @@ const authorization = await client.a2aAuthorizeTool({
     field: 'status',
     value: 'active'
   },
+  actorChain: [
+    { id: 'planner-agent-01', framework: 'langgraph' },
+    { id: 'manager-agent-01', framework: 'openclaw' }
+  ],
+  scopes: ['salesforce:account:update'],
+  rootJti: 'root-delegation-token-id',
+  parentJti: 'parent-delegation-token-id',
+  policyId: 'salesforce-account-policy',
+  policyVersion: '4',
+  proofThumbprint: '<RFC7638 proof-key thumbprint>',
   policyContext: {
     request_purpose: 'delegated_task'
   }
@@ -256,7 +317,7 @@ const authorization = await client.a2aAuthorizeTool({
 console.log(authorization);
 ```
 
-Depending on policy, the response may include a cryptographic decision token that downstream specialist runtimes can verify.
+`userId` and `sourceAgentId` may be supplied together: the user is the originating subject and the agents are actors operating on that subject's behalf. Depending on policy, the response may include a cryptographic decision token that downstream specialist runtimes must verify and consume before executing the tool.
 
 ---
 
@@ -277,12 +338,32 @@ const verified = await client.a2aVerifyDecisionTokenRpc(
     agentId: 'salesforce-specialist-01',
     sourceAgentId: 'manager-agent-01',
     platform: 'openclaw',
-    requireAllowed: true
+    userId: 'originating-user-01',
+    sessionId: 'sess_prod_01J4X',
+    proofToken: signedDpopProof,
+    requireAllowed: true,
+    consume: true
   }
 );
 
 console.log(verified);
 ```
+
+Create an RS256 proof key and bind a DPoP proof to the verification request:
+
+```ts
+import { createDpopProof, generateRsaProofKey } from 'agenticdome-sdk';
+
+const proofKey = generateRsaProofKey();
+const signedDpopProof = createDpopProof({
+  privateKeyPem: proofKey.privateKeyPem,
+  accessToken: 'decision_token_from_authorization',
+  method: 'POST',
+  uri: '/a2a/decision/verify'
+});
+```
+
+Administrators can inspect or revoke token state with `getDecisionTokenStatus(jti)` and `revokeDecisionToken({ rootJti })`. Lineage revocation invalidates all descendants sharing the root token ID.
 
 ---
 
@@ -313,6 +394,8 @@ console.log(output);
 ## MCP JSON-RPC Integration
 
 Call MCP-compatible tools through the AgenticDome MCP endpoint.
+
+For an inline Node.js host or gateway, follow the [MCP Gateway Integration Guide](docs/mcp-integration.md). It shows where to authorize the tool request, when the existing MCP transport may run, and how to review returned content before planner reuse.
 
 ```ts
 const result = await client.mcpGuardrailValidate({
@@ -382,6 +465,13 @@ Fetch trust score:
 ```ts
 const trust = await client.getTrustScore('support-agent-01');
 console.log(trust);
+```
+
+Fetch the signed behavioral window and active threat-signature bundle status:
+
+```ts
+const behavior = await client.getBehavioralAttestation('support-agent-01');
+const signatures = await client.getThreatSignatureStatus();
 ```
 
 Report an incident:
@@ -611,7 +701,7 @@ The SDK uses:
 Configure in code:
 
 ```ts
-const client = new AgentGuardClient('https://au.agenticdome.io', {
+const client = new AgentGuardClient('https://your-assigned-sidecar.example', {
   apiKey: process.env.AGENTGUARD_API_KEY,
   tenantId: process.env.AGENTGUARD_TENANT_ID,
   timeout: 20,
@@ -671,10 +761,12 @@ import { GuardrailClient } from 'agenticdome-sdk';
 
 ## Production Recommendations
 
-Use the regional AgenticDome endpoint:
+Use the tenant's assigned AgenticDome endpoint. For managed service this
+reflects the selected supported geographic region; for Sovereign deployments
+it is the endpoint inside the contracted customer-controlled environment:
 
 ```ts
-const client = new AgentGuardClient('https://au.agenticdome.io', {
+const client = new AgentGuardClient('https://your-assigned-sidecar.example', {
   apiKey: process.env.AGENTGUARD_API_KEY,
   tenantId: process.env.AGENTGUARD_TENANT_ID,
   timeout: 20,
@@ -708,4 +800,6 @@ npm run build
 
 ## License
 
-Distributed under the MIT License. See `LICENSE` for more information.
+The TypeScript SDK client and its public documentation are open source under the [Apache License 2.0](https://github.com/agenticdome/agenticdome-sdk-ts/blob/main/LICENSE). Live policy enforcement requires an active AgenticDome tenant and assigned runtime service. The AgenticDome sidecar, management console, policy engine, threat intelligence, and server-side decision logic are separate proprietary products and are not licensed under this SDK repository's Apache-2.0 license. See [NOTICE](https://github.com/agenticdome/agenticdome-sdk-ts/blob/main/NOTICE) for the commercial service boundary.
+
+Contributions are welcome under [CONTRIBUTING.md](https://github.com/agenticdome/agenticdome-sdk-ts/blob/main/CONTRIBUTING.md). Use the public [issue tracker](https://github.com/agenticdome/agenticdome-sdk-ts/issues) for ordinary defects and questions. Report vulnerabilities privately as described in [SECURITY.md](https://github.com/agenticdome/agenticdome-sdk-ts/blob/main/SECURITY.md).

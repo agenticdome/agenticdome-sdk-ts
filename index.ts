@@ -4,7 +4,15 @@ import axios, {
   Method,
 } from 'axios';
 import { promises as fs } from 'node:fs';
-import { randomBytes } from 'node:crypto';
+import {
+  createHash,
+  createPrivateKey,
+  createPublicKey,
+  generateKeyPairSync,
+  randomBytes,
+  randomUUID,
+  sign as cryptoSign,
+} from 'node:crypto';
 import http from 'node:http';
 import https from 'node:https';
 
@@ -13,6 +21,171 @@ type Dict = Record<string, any>;
 
 const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504]);
 const RETRYABLE_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']);
+export const IDENTITY_CONTEXT_VERSION = 'agenticdome.identity.v1';
+
+function b64url(data: Buffer): string {
+  return data.toString('base64url');
+}
+
+function identityText(value: unknown): string {
+  return String(value ?? '').trim();
+}
+
+function identityList(value: unknown): string[] {
+  const values = typeof value === 'string'
+    ? value.replace(/,/g, ' ').split(/\s+/)
+    : Array.isArray(value) ? value : value == null ? [] : [value];
+  return [...new Set(values.map(identityText).filter(Boolean))].sort();
+}
+
+function stableIdentityValue(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (value === null || ['string', 'number', 'boolean'].includes(typeof value)) return value;
+  if (value === undefined) return null;
+  if (Array.isArray(value)) return value.map((item) => stableIdentityValue(item, seen));
+  if (typeof value === 'object') {
+    if (seen.has(value)) return '<cycle>';
+    seen.add(value);
+    const result: Dict = {};
+    for (const key of Object.keys(value as Dict).sort()) {
+      result[key] = stableIdentityValue((value as Dict)[key], seen);
+    }
+    seen.delete(value);
+    return result;
+  }
+  return identityText(value);
+}
+
+function sha256(value: unknown): string {
+  const serialized = JSON.stringify(stableIdentityValue(value));
+  return `sha256:${createHash('sha256').update(serialized).digest('hex')}`;
+}
+
+export function canonicalizeIdentityContext(
+  policyContext: Dict = {},
+  options: { platform?: string; targetAgentId?: string } = {},
+): Dict {
+  const context = { ...policyContext };
+  const existing = context.agenticdome_identity;
+  if (existing && typeof existing === 'object' && existing.version === IDENTITY_CONTEXT_VERSION) {
+    return existing;
+  }
+
+  const claims = context.verified_identity_claims && typeof context.verified_identity_claims === 'object'
+    ? { ...context.verified_identity_claims }
+    : {};
+  const assertedSubject = identityText(claims.oid || claims.sub || claims.user_id);
+  const runtimeSubject = identityText(context.user_id || context.principal_id || context.caller_id);
+  const subjectId = runtimeSubject || assertedSubject;
+  const subject = subjectId ? {
+    id: subjectId,
+    type: runtimeSubject || claims.oid ? 'human' : 'principal',
+    tenant_id: identityText(claims.tid || context.entra_tenant_id || context.tenant_id) || null,
+    issuer: identityText(claims.iss || context.issuer) || null,
+    provenance: runtimeSubject ? 'runtime_context' : 'client_claim_assertion',
+    verified: false,
+    attributes: {
+      asserted_roles: identityList(claims.roles || context.roles),
+      asserted_scopes: identityList(claims.scp || context.scp),
+    },
+  } : null;
+
+  const rawChain = context.actor_chain || context.delegation_chain || [];
+  const chain = Array.isArray(rawChain) ? rawChain : [rawChain];
+  const actors: Dict[] = [];
+  const addActor = (actorId: unknown, framework: unknown, provenance: string): void => {
+    const id = identityText(actorId);
+    if (!id || id.length > 512 || actors.length >= 32 || actors.some((actor) => actor.id === id)) return;
+    actors.push({
+      id,
+      type: 'agent',
+      framework: identityText(framework) || null,
+      verified: false,
+      provenance,
+    });
+  };
+
+  for (const item of chain) {
+    if (item && typeof item === 'object') {
+      const actor = item as Dict;
+      addActor(actor.id || actor.sub || actor.agent_id, actor.framework || actor.platform, 'client_runtime_assertion');
+    } else {
+      addActor(item, '', 'runtime_context');
+    }
+  }
+  addActor(context.source_agent_id, context.source_platform || options.platform, 'request_binding');
+  addActor(
+    options.targetAgentId || context.target_agent_id || context.agent_id,
+    context.platform || options.platform,
+    'request_binding',
+  );
+
+  return {
+    version: IDENTITY_CONTEXT_VERSION,
+    framework: identityText(options.platform || context.platform) || 'unknown',
+    subject,
+    actors,
+    provenance: {
+      client_claims_asserted: Object.keys(claims).length > 0,
+      verified_claims_present: false,
+      native_context_hash: sha256(context),
+    },
+  };
+}
+
+export function enrichPolicyContext(
+  policyContext: Dict = {},
+  options: { platform?: string; targetAgentId?: string } = {},
+): Dict {
+  const context = { ...policyContext };
+  context.agenticdome_identity = canonicalizeIdentityContext(context, options);
+  return context;
+}
+
+export interface RsaProofKey {
+  privateKeyPem: string;
+  publicJwk: { kty: string; n: string; e: string };
+  thumbprint: string;
+}
+
+export function jwkThumbprint(jwk: { kty: string; n: string; e: string }): string {
+  const canonical = JSON.stringify({ e: jwk.e, kty: jwk.kty, n: jwk.n });
+  return b64url(createHash('sha256').update(canonical).digest());
+}
+
+export function generateRsaProofKey(): RsaProofKey {
+  const { privateKey, publicKey } = generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+    publicExponent: 0x10001,
+  });
+  const privateKeyPem = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
+  const exported = publicKey.export({ format: 'jwk' }) as Dict;
+  const publicJwk = { kty: String(exported.kty), n: String(exported.n), e: String(exported.e) };
+  return { privateKeyPem, publicJwk, thumbprint: jwkThumbprint(publicJwk) };
+}
+
+export function createDpopProof(options: {
+  privateKeyPem: string;
+  accessToken: string;
+  method: string;
+  uri: string;
+  proofJti?: string;
+  issuedAt?: number;
+}): string {
+  const privateKey = createPrivateKey(options.privateKeyPem);
+  const exported = createPublicKey(privateKey).export({ format: 'jwk' }) as Dict;
+  const publicJwk = { kty: String(exported.kty), n: String(exported.n), e: String(exported.e) };
+  const header = { typ: 'dpop+jwt', alg: 'RS256', jwk: publicJwk };
+  const payload = {
+    jti: options.proofJti || randomUUID().replace(/-/g, ''),
+    iat: Math.trunc(options.issuedAt ?? Date.now() / 1000),
+    htm: options.method.toUpperCase(),
+    htu: options.uri,
+    ath: b64url(createHash('sha256').update(options.accessToken).digest()),
+  };
+  const signingInput = `${b64url(Buffer.from(JSON.stringify(header)))}.${b64url(Buffer.from(JSON.stringify(payload)))}`;
+  const signature = cryptoSign('RSA-SHA256', Buffer.from(signingInput), privateKey);
+  return `${signingInput}.${b64url(signature)}`;
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -84,6 +257,7 @@ export interface AgentGuardClientOptions {
   timeout?: number; // seconds
   userAgent?: string;
   maxRetries?: number;
+  executionBrokerMode?: 'off' | 'observe' | 'enforce';
 }
 
 interface RequestOptions {
@@ -128,6 +302,13 @@ export interface GuardrailValidateOptions {
   toolPlatform?: string;
   toolName?: string;
   toolArgs?: Dict;
+  toolVersion?: string;
+  toolDigest?: string;
+  executionBroker?: boolean;
+  executionBoundaryId?: string;
+  executionDestination?: string;
+  executionHttpMethod?: string;
+  workloadId?: string;
   policyContext?: Dict;
   reasoningTrace?: string;
   agentInstanceId?: string;
@@ -178,6 +359,8 @@ export interface A2AAuthorizeToolOptions {
   sourcePlatform: string;
   toolName: string;
   toolArgs: Dict;
+  toolVersion?: string;
+  toolDigest?: string;
   toolPlatform?: string;
   policyContext?: Dict;
   sessionId?: string;
@@ -195,6 +378,16 @@ export interface A2AAuthorizeToolOptions {
   blockOnSensitiveOutput?: boolean;
   trustedDestinationDomains?: string[];
   allowedDestinationDomains?: string[];
+  userId?: string;
+  actorChain?: Dict[];
+  scopes?: string[];
+  permissions?: string[];
+  parentJti?: string;
+  rootJti?: string;
+  policyId?: string;
+  policyVersion?: string;
+  policyHash?: string;
+  proofThumbprint?: string;
   tenantId?: TenantId;
   requestId?: string | number;
 }
@@ -202,12 +395,28 @@ export interface A2AAuthorizeToolOptions {
 export interface VerifyDecisionTokenOptions {
   toolName?: string;
   toolArgs?: Dict;
+  toolVersion?: string;
+  toolDigest?: string;
   agentId?: string;
   sourceAgentId?: string;
   platform?: string;
+  userId?: string;
+  sessionId?: string;
+  proofThumbprint?: string;
+  proofToken?: string;
   requireAllowed?: boolean;
+  consume?: boolean;
   tenantId?: TenantId;
   requestId?: string | number;
+}
+
+export interface RevokeDecisionTokenOptions {
+  jti?: string;
+  rootJti?: string;
+  agentId?: string;
+  userId?: string;
+  reason?: string;
+  tenantId?: TenantId;
 }
 
 export interface MCPGuardrailValidateOptions {
@@ -218,6 +427,8 @@ export interface MCPGuardrailValidateOptions {
   toolPlatform?: string;
   toolName?: string;
   toolArgs?: Dict;
+  toolVersion?: string;
+  toolDigest?: string;
   policyContext?: Dict;
   direction?: string;
   sourceAgentId?: string;
@@ -266,6 +477,7 @@ export class AgentGuardClient {
   private readonly timeout: number; // seconds
   private readonly userAgent: string;
   private readonly maxRetries: number;
+  private readonly executionBrokerMode: 'off' | 'observe' | 'enforce';
   private readonly api: AxiosInstance;
   private readonly httpAgent: http.Agent;
   private readonly httpsAgent: https.Agent;
@@ -280,8 +492,15 @@ export class AgentGuardClient {
     this.bearerToken =
       options.bearerToken || process.env.AGENTGUARD_BEARER_TOKEN;
     this.timeout = options.timeout ?? 20;
-    this.userAgent = options.userAgent ?? 'agentguard-sdk/0.4.0';
+    this.userAgent = options.userAgent ?? 'agenticdome-sdk/0.6.0';
     this.maxRetries = options.maxRetries ?? 3;
+    const brokerMode = String(
+      options.executionBrokerMode ?? process.env.AGENTICDOME_EXECUTION_BROKER_MODE ?? 'off',
+    ).trim().toLowerCase();
+    if (!['off', 'observe', 'enforce'].includes(brokerMode)) {
+      throw new Error('executionBrokerMode must be off, observe, or enforce');
+    }
+    this.executionBrokerMode = brokerMode as 'off' | 'observe' | 'enforce';
 
     this.httpAgent = new http.Agent({
       keepAlive: true,
@@ -391,7 +610,10 @@ export class AgentGuardClient {
       }
     }
 
-    return pc;
+    return enrichPolicyContext(pc, {
+      platform: this.normalizeOptionalString(pc.platform),
+      targetAgentId: this.normalizeOptionalString(pc.target_agent_id || pc.agent_id),
+    });
   }
 
   private validateGuardrailArgs(args: {
@@ -411,14 +633,9 @@ export class AgentGuardClient {
     const toolName = this.normalizeOptionalString(args.toolName);
     const sourceAgentId = this.normalizeOptionalString(args.sourceAgentId);
     const sourcePlatform = this.normalizeOptionalString(args.sourcePlatform);
-    const userId = this.normalizeOptionalString(args.userId);
     const platform = this.normalizeOptionalString(args.platform);
 
     const normalizedDirection = this.normalizeDirection(args.direction);
-
-    if (sourceAgentId && userId) {
-      throw new Error("Provide either 'source_agent_id' or 'user_id', not both");
-    }
 
     if (toolName && args.toolArgs === undefined) {
       throw new Error("'tool_args' is required when 'tool_name' is provided");
@@ -789,11 +1006,14 @@ export class AgentGuardClient {
     });
 
     const mergedPolicyContext = this.mergePolicyContext(options.policyContext, {
+      agent_id: options.agentId,
       platform: options.platform,
       source_platform: options.sourcePlatform,
       tool_platform: options.toolPlatform,
       tool_name: options.toolName,
       tool_args: options.toolArgs,
+      tool_version: options.toolVersion,
+      tool_digest: options.toolDigest,
       reasoning_trace: options.reasoningTrace,
       agent_instance_id: options.agentInstanceId,
       user_id: options.userId,
@@ -822,6 +1042,8 @@ export class AgentGuardClient {
       tool_platform: options.toolPlatform,
       tool_name: options.toolName,
       tool_args: options.toolArgs,
+      tool_version: options.toolVersion,
+      tool_digest: options.toolDigest,
       policy_context: mergedPolicyContext,
       reasoning_trace: options.reasoningTrace,
       agent_instance_id: options.agentInstanceId,
@@ -842,10 +1064,74 @@ export class AgentGuardClient {
       attachments: options.attachments,
     });
 
-    return this.request('POST', '/tools/guardrail/validate', {
+    if (options.toolDigest && !/^sha256:[0-9a-f]{64}$/.test(options.toolDigest)) {
+      throw new Error("'toolDigest' must be sha256 followed by 64 lowercase hexadecimal characters");
+    }
+    const brokerEnabled = Boolean(
+      options.toolName
+      && (options.executionBroker === true || ['observe', 'enforce'].includes(this.executionBrokerMode)),
+    );
+    if (brokerEnabled) {
+      const material = [
+        options.platform ?? 'unknown',
+        options.agentId,
+        options.toolName,
+        options.sessionId ?? 'stateless',
+      ].join('|');
+      payload.boundary_id = options.executionBoundaryId
+        ?? `sdk:${createHash('sha256').update(material).digest('hex').slice(0, 32)}`;
+      if (options.executionDestination !== undefined) {
+        const destination = options.executionDestination.trim();
+        if (!destination || destination.length > 2048) {
+          throw new Error("'executionDestination' must be a non-empty URL/origin up to 2048 characters");
+        }
+        payload.destination = destination;
+      }
+      if (options.executionHttpMethod !== undefined) {
+        const method = options.executionHttpMethod.trim().toUpperCase();
+        if (!/^[A-Z]{1,16}$/.test(method)) {
+          throw new Error("'executionHttpMethod' must contain 1-16 letters");
+        }
+        payload.http_method = method;
+      }
+      if (options.workloadId !== undefined) {
+        const workloadId = options.workloadId.trim();
+        if (!workloadId || workloadId.length > 512 || !workloadId.startsWith('spiffe://')) {
+          throw new Error("'workloadId' must be a non-empty SPIFFE ID up to 512 characters");
+        }
+        payload.workload_id = workloadId;
+      }
+    }
+    const response = await this.request('POST', brokerEnabled ? '/tools/execution/authorize' : '/tools/guardrail/validate', {
       tenantId: options.tenantId,
       jsonBody: payload,
     });
+    if (brokerEnabled) {
+      const broker = response.broker && typeof response.broker === 'object' ? response.broker : {};
+      const verified = Boolean(broker.verified && broker.token_consumed);
+      if ((options.executionBroker === true || this.executionBrokerMode === 'enforce') && !verified) {
+        throw new AgentGuardError('AgenticDome execution broker did not return a verified, atomically consumed decision');
+      }
+    }
+    return response;
+  }
+
+  enforcementHeaders(result: Dict, workloadId?: string): Record<string, string> {
+    const receipt = String(result.execution_receipt ?? '').trim();
+    if (!receipt) {
+      throw new AgentGuardError('Broker result does not contain an execution receipt');
+    }
+    const headers: Record<string, string> = {
+      'X-AgenticDome-Execution-Receipt': receipt,
+    };
+    if (workloadId !== undefined) {
+      const normalized = workloadId.trim();
+      if (!normalized.startsWith('spiffe://')) {
+        throw new Error("'workloadId' must be a SPIFFE ID");
+      }
+      headers['X-AgenticDome-Workload-Id'] = normalized;
+    }
+    return headers;
   }
 
   async guardrailCheck(
@@ -862,6 +1148,10 @@ export class AgentGuardClient {
       sessionId,
       policyContext,
     });
+  }
+
+  async getToolProvenanceStatus(tenantId?: TenantId): Promise<Dict> {
+    return this.request('GET', '/tools/provenance/status', { tenantId });
   }
 
   // ------------------------------------------------------------------
@@ -883,6 +1173,7 @@ export class AgentGuardClient {
     });
 
     const mergedPolicyContext = this.mergePolicyContext(options.policyContext, {
+      agent_id: options.agentId,
       platform: effectivePlatform,
       source_platform: options.sourcePlatform,
       source_agent_id: options.sourceAgentId,
@@ -943,6 +1234,18 @@ export class AgentGuardClient {
     return this.request('GET', path, { tenantId });
   }
 
+  async getBehavioralAttestation(
+    agentId: string,
+    tenantId?: TenantId,
+  ): Promise<Dict> {
+    this.requireNonempty('agent_id', agentId);
+    return this.request('GET', `/trust/behavior/${encodeURIComponent(agentId)}`, { tenantId });
+  }
+
+  async getThreatSignatureStatus(tenantId?: TenantId): Promise<Dict> {
+    return this.request('GET', '/security/threat-signatures/status', { tenantId });
+  }
+
   async reportIncident(
     agentId: string,
     incidentType: string,
@@ -968,10 +1271,14 @@ export class AgentGuardClient {
 
   async resetTrustScore(
     agentId: string,
-    adminSecret: string,
+    serviceToken?: string,
     tenantId?: TenantId,
     isAgent = true,
   ): Promise<Dict> {
+    const token = serviceToken || process.env.AGENTICDOME_SERVICE_TOKEN || process.env.SERVICE_SECRET;
+    if (!token) {
+      throw new Error('resetTrustScore requires serviceToken or AGENTICDOME_SERVICE_TOKEN');
+    }
     const path = `/trust/reset/${encodeURIComponent(agentId)}?is_agent=${
       isAgent ? 'true' : 'false'
     }`;
@@ -979,7 +1286,7 @@ export class AgentGuardClient {
     return this.request('POST', path, {
       tenantId,
       extraHeaders: {
-        'X-Admin-Secret': adminSecret,
+        'X-Service-Token': token,
       },
     });
   }
@@ -1023,12 +1330,15 @@ export class AgentGuardClient {
     });
 
     const mergedPolicyContext = this.mergePolicyContext(options.policyContext, {
+      agent_id: options.agentId,
       platform: options.platform,
       source_platform: options.sourcePlatform,
       tool_platform: options.toolPlatform,
       source_agent_id: options.sourceAgentId,
       tool_name: options.toolName,
       tool_args: options.toolArgs,
+      tool_version: options.toolVersion,
+      tool_digest: options.toolDigest,
       request_purpose: options.requestPurpose,
       purpose: options.purpose,
       intent: options.intent,
@@ -1042,6 +1352,16 @@ export class AgentGuardClient {
       block_on_sensitive_output: options.blockOnSensitiveOutput,
       trusted_destination_domains: options.trustedDestinationDomains,
       allowed_destination_domains: options.allowedDestinationDomains,
+      user_id: options.userId,
+      actor_chain: options.actorChain,
+      scopes: options.scopes,
+      permissions: options.permissions,
+      parent_jti: options.parentJti,
+      root_jti: options.rootJti,
+      policy_id: options.policyId,
+      policy_version: options.policyVersion,
+      policy_hash: options.policyHash,
+      proof_thumbprint: options.proofThumbprint,
     });
 
     const args = dropNone({
@@ -1054,6 +1374,8 @@ export class AgentGuardClient {
       tool_platform: options.toolPlatform,
       tool_name: options.toolName,
       tool_args: options.toolArgs,
+      tool_version: options.toolVersion,
+      tool_digest: options.toolDigest,
       policy_context: mergedPolicyContext,
       source_agent_id: options.sourceAgentId,
       request_purpose: options.requestPurpose,
@@ -1069,6 +1391,16 @@ export class AgentGuardClient {
       block_on_sensitive_output: options.blockOnSensitiveOutput,
       trusted_destination_domains: options.trustedDestinationDomains,
       allowed_destination_domains: options.allowedDestinationDomains,
+      user_id: options.userId,
+      actor_chain: options.actorChain,
+      scopes: options.scopes,
+      permissions: options.permissions,
+      parent_jti: options.parentJti,
+      root_jti: options.rootJti,
+      policy_id: options.policyId,
+      policy_version: options.policyVersion,
+      policy_hash: options.policyHash,
+      proof_thumbprint: options.proofThumbprint,
     });
 
     return this.a2aActionCall('security.tool.authorize', args, {
@@ -1103,10 +1435,17 @@ export class AgentGuardClient {
       token,
       tool_name: options.toolName,
       tool_args: options.toolArgs,
+      tool_version: options.toolVersion,
+      tool_digest: options.toolDigest,
       agent_id: options.agentId,
       source_agent_id: options.sourceAgentId,
       platform: options.platform,
+      user_id: options.userId,
+      session_id: options.sessionId,
+      proof_thumbprint: options.proofThumbprint,
+      proof_token: options.proofToken,
       require_allowed: options.requireAllowed ?? true,
+      consume: options.consume ?? true,
     });
 
     return this.request('POST', '/a2a/decision/verify', {
@@ -1129,15 +1468,43 @@ export class AgentGuardClient {
       token,
       tool_name: options.toolName,
       tool_args: options.toolArgs,
+      tool_version: options.toolVersion,
+      tool_digest: options.toolDigest,
       agent_id: options.agentId,
       source_agent_id: options.sourceAgentId,
       platform: options.platform,
+      user_id: options.userId,
+      session_id: options.sessionId,
+      proof_thumbprint: options.proofThumbprint,
+      proof_token: options.proofToken,
       require_allowed: options.requireAllowed ?? true,
+      consume: options.consume ?? true,
     });
 
     return this.a2aActionCall('security.decision.verify', args, {
       requestId: options.requestId ?? '1',
       tenantId: options.tenantId,
+    });
+  }
+
+  async getDecisionTokenStatus(jti: string, tenantId?: TenantId): Promise<Dict> {
+    this.requireNonempty('jti', jti);
+    return this.request('GET', `/a2a/decision/status/${encodeURIComponent(jti)}`, { tenantId });
+  }
+
+  async revokeDecisionToken(options: RevokeDecisionTokenOptions): Promise<Dict> {
+    if (![options.jti, options.rootJti, options.agentId, options.userId].some((value) => this.normalizeOptionalString(value))) {
+      throw new Error('revokeDecisionToken requires jti, rootJti, agentId, or userId');
+    }
+    return this.request('POST', '/a2a/decision/revoke', {
+      tenantId: options.tenantId,
+      jsonBody: dropNone({
+        jti: options.jti,
+        root_jti: options.rootJti,
+        agent_id: options.agentId,
+        user_id: options.userId,
+        reason: options.reason || 'revoked by tenant administrator',
+      }),
     });
   }
 
@@ -1227,6 +1594,13 @@ export class AgentGuardClient {
       trusted_destination_domains: options.trustedDestinationDomains,
       allowed_destination_domains: options.allowedDestinationDomains,
     });
+
+    if (options.toolName && ['observe', 'enforce'].includes(this.executionBrokerMode)) {
+      return this.guardrailValidate({
+        ...options,
+        executionBroker: true,
+      });
+    }
 
     return this.mcpToolCall('guardrail.validate', args, {
       requestId: options.requestId ?? '1',

@@ -1,9 +1,9 @@
 {
   "name": "agenticdome-sdk",
-  "version": "0.5.2",
+  "version": "0.6.1",
   "description": "TypeScript SDK for AgenticDome AI security, guardrails, trust, A2A, MCP, and enterprise SaaS scanning APIs",
   "author": "",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "homepage": "https://github.com/agenticdome/agenticdome-sdk-ts#readme",
   "repository": {
     "type": "git",
@@ -34,7 +34,11 @@
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "NOTICE",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "docs"
   ],
   "scripts": {
     "clean": "rm -rf dist",
@@ -44,7 +48,7 @@
     "prepublishOnly": "npm run clean && npm run typecheck && npm run build"
   },
   "dependencies": {
-    "axios": "^1.7.9"
+    "axios": "^1.19.0"
   },
   "devDependencies": {
     "@types/jest": "^29.5.14",
@@ -56,6 +60,9 @@
   },
   "engines": {
     "node": ">=18"
+  },
+  "overrides": {
+    "esbuild": "^0.28.1"
   },
   "publishConfig": {
     "access": "public"
