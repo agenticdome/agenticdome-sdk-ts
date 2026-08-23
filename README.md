@@ -4,7 +4,7 @@
 [![CI](https://github.com/agenticdome/agenticdome-sdk-ts/actions/workflows/ci.yml/badge.svg)](https://github.com/agenticdome/agenticdome-sdk-ts/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 
-> **TypeScript SDK for AgenticDome AI security, guardrails, agent trust, delegation authorization, MCP/A2A security, and enterprise SaaS risk scanning.**
+> **Official TypeScript client for the AgenticDome action firewall, runtime guardrails, tool authorization, trust, A2A, and MCP APIs.**
 
 [MCP Gateway Integration Guide](https://github.com/agenticdome/agenticdome-sdk-ts/blob/main/docs/mcp-integration.md) · [Issue tracker](https://github.com/agenticdome/agenticdome-sdk-ts/issues) · [Security policy](https://github.com/agenticdome/agenticdome-sdk-ts/blob/main/SECURITY.md)
 
@@ -23,6 +23,11 @@ It provides a typed API client for:
 - Salesforce, Microsoft, and ServiceNow scan endpoints
 - Red-team simulation triggers
 - Microsoft Copilot / AI Foundry threat APIs
+- Runtime readiness, signed tool-provenance status, and behavioral summaries
+
+This npm package is the low-level TypeScript client. The Python package additionally ships framework-specific adapters, the `agenticdome-demo` CLI, and the full high-level MCP host/gateway firewall. `agenticdome-openclaw-security` is the separate native OpenClaw lifecycle plugin. Those packages share the same policy protocol but intentionally expose runtime-specific integration surfaces.
+
+For MCP, `agenticdome-sdk` calls the assigned AgenticDome sidecar's MCP-shaped policy APIs. It does not forward requests to a customer MCP server, replace the application's transport, or depend on `@modelcontextprotocol/sdk`. MCP providers can use it inside a provider-controlled dispatcher, and customers can use it in a host or gateway, but each protected request must carry the correct tenant context and pass through that explicit integration boundary.
 
 ---
 
@@ -93,39 +98,40 @@ The SDK can be configured directly in code or by environment variables.
 Most integrations need:
 
 ```bash
-export AGENTGUARD_API_KEY="your_api_key_abc123..."
-export AGENTGUARD_TENANT_ID="your_tenant_id_xyz789..."
+export AGENTICDOME_API_KEY="your_api_key_abc123..."
+export AGENTICDOME_TENANT_ID="your_tenant_id_xyz789..."
 ```
 
 Then pass the tenant's assigned runtime sidecar URL when constructing the client:
 
 ```ts
-const client = new AgentGuardClient('https://your-assigned-sidecar.example');
+const client = new AgenticDomeClient('https://your-assigned-sidecar.example');
 ```
 
 ### Optional Environment Variables
 
 ```bash
 # Optional bearer token for Microsoft Copilot / AI Foundry style APIs.
-export AGENTGUARD_BEARER_TOKEN="your_bearer_token"
+export AGENTICDOME_BEARER_TOKEN="your_bearer_token"
+
+# Optional service credential for protected trust and behavioral APIs.
+export AGENTICDOME_SERVICE_TOKEN="your_service_token"
 
 # Optional defaults used by the SDK if not passed in code.
-export AGENTGUARD_API_KEY="your_api_key"
-export AGENTGUARD_TENANT_ID="your_tenant_id"
+export AGENTICDOME_API_KEY="your_api_key"
+export AGENTICDOME_TENANT_ID="your_tenant_id"
 ```
-
-> Note: The SDK class names retain `AgentGuardClient` for backward compatibility, while the published npm package and product brand are `agenticdome-sdk` and AgenticDome.
 
 ---
 
 ## Quick Start
 
 ```ts
-import AgentGuardClient from 'agenticdome-sdk';
+import AgenticDomeClient from 'agenticdome-sdk';
 
-const client = new AgentGuardClient('https://your-assigned-sidecar.example', {
-  apiKey: process.env.AGENTGUARD_API_KEY,
-  tenantId: process.env.AGENTGUARD_TENANT_ID
+const client = new AgenticDomeClient('https://your-assigned-sidecar.example', {
+  apiKey: process.env.AGENTICDOME_API_KEY,
+  tenantId: process.env.AGENTICDOME_TENANT_ID
 });
 
 const result = await client.guardrailValidate({
@@ -147,24 +153,18 @@ client.close();
 Default import:
 
 ```ts
-import AgentGuardClient from 'agenticdome-sdk';
+import AgenticDomeClient from 'agenticdome-sdk';
 ```
 
 Named imports:
 
 ```ts
 import {
-  AgentGuardClient,
-  GuardrailClient,
-  AgentGuardError,
-  AgentGuardHTTPError
-} from 'agenticdome-sdk';
-```
-
-Backward-compatible alias:
-
-```ts
-import { GuardrailClient } from 'agenticdome-sdk';
+  AgenticDomeClient,
+  AgenticDomeError,
+  AgenticDomeHTTPError,
+  SDK_VERSION
+} from "agenticdome-sdk";
 ```
 
 ---
@@ -174,11 +174,11 @@ import { GuardrailClient } from 'agenticdome-sdk';
 Use `guardrailValidate` to inspect inbound prompts, outbound responses, or tool execution requests.
 
 ```ts
-import AgentGuardClient from 'agenticdome-sdk';
+import AgenticDomeClient from 'agenticdome-sdk';
 
-const client = new AgentGuardClient('https://your-assigned-sidecar.example', {
-  apiKey: process.env.AGENTGUARD_API_KEY,
-  tenantId: process.env.AGENTGUARD_TENANT_ID
+const client = new AgenticDomeClient('https://your-assigned-sidecar.example', {
+  apiKey: process.env.AGENTICDOME_API_KEY,
+  tenantId: process.env.AGENTICDOME_TENANT_ID
 });
 
 const verdict = await client.guardrailValidate({
@@ -240,6 +240,16 @@ const result = await client.guardrailValidate({
 });
 
 console.log(result);
+
+const decision = String(result.verdict ?? result.decision ?? "UNKNOWN").toUpperCase();
+if (decision !== "ALLOWED") {
+  throw new Error("AgenticDome blocked the tool action: " + decision);
+}
+await updateSalesforceAccount(result.sanitized_tool_args ?? {
+  account_id: "001xx000003DGbY",
+  field: "billing_email",
+  value: "customer@example.com"
+});
 ```
 
 ### Brokered execution and the enforcement gateway
@@ -247,9 +257,9 @@ console.log(result);
 For protected tools, set broker mode to `enforce`, bind the decision to the real destination/method/tool digest/workload, and add the returned one-use receipt to the actual outbound request:
 
 ```ts
-const client = new AgentGuardClient('https://your-sidecar.example.com', {
-  apiKey: process.env.AGENTGUARD_API_KEY,
-  tenantId: process.env.AGENTGUARD_TENANT_ID,
+const client = new AgenticDomeClient('https://your-sidecar.example.com', {
+  apiKey: process.env.AGENTICDOME_API_KEY,
+  tenantId: process.env.AGENTICDOME_TENANT_ID,
   executionBrokerMode: 'enforce'
 });
 
@@ -393,7 +403,7 @@ console.log(output);
 
 ## MCP JSON-RPC Integration
 
-Call MCP-compatible tools through the AgenticDome MCP endpoint.
+Use the AgenticDome sidecar's MCP-shaped policy endpoint to authorize an MCP action. These methods do not forward the business request to your MCP provider; the application invokes its existing transport only after enforcing the returned verdict.
 
 For an inline Node.js host or gateway, follow the [MCP Gateway Integration Guide](docs/mcp-integration.md). It shows where to authorize the tool request, when the existing MCP transport may run, and how to review returned content before planner reuse.
 
@@ -421,6 +431,8 @@ List MCP tools:
 const tools = await client.mcpListTools();
 console.log(tools);
 ```
+
+`mcpListTools()` lists the AgenticDome sidecar's MCP policy tools; it is not discovery against the application's downstream MCP server. AgenticDome does not install or certify `@modelcontextprotocol/sdk`, so that transport dependency and version remain owned by the application or MCP provider.
 
 ---
 
@@ -451,6 +463,21 @@ console.log(result);
 
 ---
 
+## Runtime Readiness and Tool Provenance
+
+```ts
+const readiness = await client.getRuntimeReadiness();
+const provenanceStatus = await client.getToolProvenanceStatus();
+
+client.registerToolProvenance("crm.customer.update", {
+  toolPlatform: "crm",
+  toolVersion: "2.4.0",
+  toolDigest: "sha256:" + "ab".repeat(32)
+});
+```
+
+Registered provenance is resolved locally for REST, A2A, MCP, and decision-token verification calls. Request values override policy-context values, which override the local registration.
+
 ## Risk and Trust APIs
 
 Fetch agent risk:
@@ -470,7 +497,8 @@ console.log(trust);
 Fetch the signed behavioral window and active threat-signature bundle status:
 
 ```ts
-const behavior = await client.getBehavioralAttestation('support-agent-01');
+const behavior = await client.getBehavioralAttestation("support-agent-01");
+const summary = await client.getBehavioralSummary(process.env.AGENTICDOME_TENANT_ID, 300);
 const signatures = await client.getThreatSignatureStatus();
 ```
 
@@ -482,7 +510,7 @@ await client.reportIncident(
   'policy_violation',
   'high',
   'Agent attempted unauthorized record deletion',
-  process.env.AGENTGUARD_TENANT_ID,
+  process.env.AGENTICDOME_TENANT_ID,
   true,
   'openclaw'
 );
@@ -500,7 +528,7 @@ const result = await client.scanSalesforce(
     instance_url: 'https://example.my.salesforce.com',
     access_token: 'redacted'
   },
-  process.env.AGENTGUARD_TENANT_ID || '1',
+  process.env.AGENTICDOME_TENANT_ID || '1',
   'Account',
   {
     scan_purpose: 'crm_security_review'
@@ -519,7 +547,7 @@ const result = await client.scanMicrosoft(
     client_id: 'client-id',
     client_secret: 'client-secret'
   },
-  process.env.AGENTGUARD_TENANT_ID || '1'
+  process.env.AGENTICDOME_TENANT_ID || '1'
 );
 
 console.log(result);
@@ -534,7 +562,7 @@ const result = await client.scanServiceNow(
     username: 'integration_user',
     password: 'redacted'
   },
-  process.env.AGENTGUARD_TENANT_ID || '1'
+  process.env.AGENTICDOME_TENANT_ID || '1'
 );
 
 console.log(result);
@@ -557,7 +585,7 @@ const job = await client.submitJob(
     scan_purpose: 'metadata_review'
   },
   'http://localhost/callback_sink',
-  process.env.AGENTGUARD_TENANT_ID || '1'
+  process.env.AGENTICDOME_TENANT_ID || '1'
 );
 
 console.log(job);
@@ -574,7 +602,7 @@ const job = await client.submitFetchJob(
     limit: 100
   },
   'credential_ref_prod_salesforce',
-  process.env.AGENTGUARD_TENANT_ID || '1'
+  process.env.AGENTICDOME_TENANT_ID || '1'
 );
 
 console.log(job);
@@ -587,7 +615,7 @@ console.log(job);
 Use bearer-token authentication for Copilot-style APIs.
 
 ```bash
-export AGENTGUARD_BEARER_TOKEN="your_bearer_token"
+export AGENTICDOME_BEARER_TOKEN="your_bearer_token"
 ```
 
 ```ts
@@ -641,13 +669,13 @@ The SDK includes scenario helpers for common enterprise attack patterns.
 await client.scenarioSalesforceHiddenBcc({
   agentId: 'salesforce-agent-01',
   sourceAgentId: 'support-agent-01',
-  tenantId: process.env.AGENTGUARD_TENANT_ID
+  tenantId: process.env.AGENTICDOME_TENANT_ID
 });
 
 await client.scenarioServicenowDeleteLogs({
   agentId: 'servicenow-agent-01',
   sourceAgentId: 'support-agent-01',
-  tenantId: process.env.AGENTGUARD_TENANT_ID
+  tenantId: process.env.AGENTICDOME_TENANT_ID
 });
 ```
 
@@ -659,8 +687,8 @@ The SDK exports structured error classes.
 
 ```ts
 import {
-  AgentGuardError,
-  AgentGuardHTTPError
+  AgenticDomeError,
+  AgenticDomeHTTPError
 } from 'agenticdome-sdk';
 
 try {
@@ -671,10 +699,10 @@ try {
     platform: 'openclaw'
   });
 } catch (error) {
-  if (error instanceof AgentGuardHTTPError) {
+  if (error instanceof AgenticDomeHTTPError) {
     console.error('HTTP status:', error.statusCode);
     console.error('Response:', error.responseText);
-  } else if (error instanceof AgentGuardError) {
+  } else if (error instanceof AgenticDomeError) {
     console.error('SDK error:', error.message);
   } else {
     console.error('Unexpected error:', error);
@@ -701,9 +729,9 @@ The SDK uses:
 Configure in code:
 
 ```ts
-const client = new AgentGuardClient('https://your-assigned-sidecar.example', {
-  apiKey: process.env.AGENTGUARD_API_KEY,
-  tenantId: process.env.AGENTGUARD_TENANT_ID,
+const client = new AgenticDomeClient('https://your-assigned-sidecar.example', {
+  apiKey: process.env.AGENTICDOME_API_KEY,
+  tenantId: process.env.AGENTICDOME_TENANT_ID,
   timeout: 20,
   maxRetries: 3,
   userAgent: 'my-enterprise-agent-runtime/1.0.0'
@@ -731,30 +759,23 @@ npm install agenticdome-openclaw-security
 ## Exported API
 
 ```ts
-import AgentGuardClient, {
-  AgentGuardClient,
-  GuardrailClient,
-  AgentGuardError,
-  AgentGuardHTTPError
-} from 'agenticdome-sdk';
+import AgenticDomeClient, {
+  AgenticDomeError,
+  AgenticDomeHTTPError,
+  SDK_VERSION
+} from "agenticdome-sdk";
 ```
 
 ### Default Export
 
 ```ts
-import AgentGuardClient from 'agenticdome-sdk';
+import AgenticDomeClient from 'agenticdome-sdk';
 ```
 
 ### Named Client Export
 
 ```ts
-import { AgentGuardClient } from 'agenticdome-sdk';
-```
-
-### Backward-Compatible Alias
-
-```ts
-import { GuardrailClient } from 'agenticdome-sdk';
+import { AgenticDomeClient } from 'agenticdome-sdk';
 ```
 
 ---
@@ -766,9 +787,9 @@ reflects the selected supported geographic region; for Sovereign deployments
 it is the endpoint inside the contracted customer-controlled environment:
 
 ```ts
-const client = new AgentGuardClient('https://your-assigned-sidecar.example', {
-  apiKey: process.env.AGENTGUARD_API_KEY,
-  tenantId: process.env.AGENTGUARD_TENANT_ID,
+const client = new AgenticDomeClient('https://your-assigned-sidecar.example', {
+  apiKey: process.env.AGENTICDOME_API_KEY,
+  tenantId: process.env.AGENTICDOME_TENANT_ID,
   timeout: 20,
   maxRetries: 3
 });
@@ -777,8 +798,8 @@ const client = new AgentGuardClient('https://your-assigned-sidecar.example', {
 Recommended environment variables:
 
 ```bash
-export AGENTGUARD_API_KEY="your_api_key"
-export AGENTGUARD_TENANT_ID="your_tenant_id"
+export AGENTICDOME_API_KEY="your_api_key"
+export AGENTICDOME_TENANT_ID="your_tenant_id"
 ```
 
 Always close the client when your process or worker is shutting down:

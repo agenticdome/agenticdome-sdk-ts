@@ -6,7 +6,15 @@ before calling its existing MCP transport, then reviews returned content before
 it re-enters an agent or model context.
 
 The TypeScript package is an API client, not an MCP proxy. It does not install
-global interception or forward traffic automatically.
+global interception or forward traffic automatically. It also does not depend
+on or certify `@modelcontextprotocol/sdk`; keep the application's existing MCP
+transport and its version lifecycle separate.
+
+An MCP provider may place these explicit calls in a provider-controlled tool
+dispatcher, or publish a customer-side gateway pattern. That does not protect
+unrelated server routes automatically: the correct customer tenant, actor,
+agent, server, tool, and argument context must reach AgenticDome before the
+provider executes the action.
 
 ## Install and configure
 
@@ -33,11 +41,11 @@ runtime.
 ## Authorize immediately before forwarding
 
 ```ts
-import { AgentGuardClient } from 'agenticdome-sdk';
+import { AgenticDomeClient } from 'agenticdome-sdk';
 
 type JsonObject = Record<string, unknown>;
 
-const client = new AgentGuardClient(process.env.AGENTICDOME_API_BASE!, {
+const client = new AgenticDomeClient(process.env.AGENTICDOME_API_BASE!, {
   apiKey: process.env.AGENTICDOME_API_KEY!,
   tenantId: process.env.AGENTICDOME_TENANT_ID!,
 });

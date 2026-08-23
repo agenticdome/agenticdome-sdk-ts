@@ -1,6 +1,6 @@
 import { createHash, createPublicKey, verify } from 'node:crypto';
 
-import AgentGuardClient, {
+import AgenticDomeClient, {
   createDpopProof,
   generateRsaProofKey,
 } from '../index';
@@ -11,7 +11,7 @@ function decodePart(value: string): Record<string, any> {
 
 describe('AgenticDome protocol v2', () => {
   test('preserves a human subject and nested agent actors together', async () => {
-    const client = new AgentGuardClient('https://sidecar.example', {
+    const client = new AgenticDomeClient('https://sidecar.example', {
       apiKey: 'test-key',
       tenantId: 'tenant-1',
     });
@@ -40,7 +40,7 @@ describe('AgenticDome protocol v2', () => {
   });
 
   test('propagates lineage, policy, proof, and atomic consumption fields', async () => {
-    const client = new AgentGuardClient('https://sidecar.example', { apiKey: 'test-key' });
+    const client = new AgenticDomeClient('https://sidecar.example', { apiKey: 'test-key' });
     const request = jest.fn().mockResolvedValue({ result: { verdict: 'ALLOWED' } });
     (client as any).request = request;
 
@@ -117,7 +117,7 @@ describe('AgenticDome protocol v2', () => {
   });
 
   test('routes tool authorization through the one-request broker in enforce mode', async () => {
-    const client = new AgentGuardClient('https://sidecar.example', {
+    const client = new AgenticDomeClient('https://sidecar.example', {
       apiKey: 'test-key',
       tenantId: 'tenant-1',
       executionBrokerMode: 'enforce',
@@ -157,7 +157,7 @@ describe('AgenticDome protocol v2', () => {
   });
 
   test('fails closed when an enforced broker receipt is missing', async () => {
-    const client = new AgentGuardClient('https://sidecar.example', {
+    const client = new AgenticDomeClient('https://sidecar.example', {
       apiKey: 'test-key',
       tenantId: 'tenant-1',
       executionBrokerMode: 'enforce',
@@ -171,6 +171,65 @@ describe('AgenticDome protocol v2', () => {
       toolName: 'crm.lookup',
       toolArgs: { id: '123' },
     })).rejects.toThrow('atomically consumed');
+    client.close();
+  });
+
+  test("derives runtime identity from package metadata and resolves registered tool provenance", async () => {
+    const client = new AgenticDomeClient("https://sidecar.example", {
+      apiKey: "test-key",
+      serviceToken: "service-token",
+      toolProvenance: {
+        "crm.update": {
+          toolPlatform: "custom",
+          toolVersion: "2.4.0",
+          toolDigest: "sha256:" + "ab".repeat(32),
+        },
+      },
+    });
+    expect((client as any).userAgent).toBe("agenticdome-sdk/" + require("../package.json").version);
+
+    const request = jest.fn().mockResolvedValue({ verdict: "ALLOWED" });
+    (client as any).request = request;
+    await client.guardrailValidate({
+      text: "update customer",
+      agentId: "support-agent",
+      platform: "custom",
+      toolPlatform: "custom",
+      toolName: "crm.update",
+      toolArgs: { id: "123" },
+    });
+    expect(request.mock.calls[0][2].jsonBody).toMatchObject({
+      tool_version: "2.4.0",
+      tool_digest: "sha256:" + "ab".repeat(32),
+    });
+
+    request.mockClear();
+    await client.mcpGuardrailValidate({
+      text: "update customer",
+      agentId: "support-agent",
+      platform: "custom",
+      toolPlatform: "custom",
+      toolName: "crm.update",
+      toolArgs: { id: "123" },
+    });
+    expect(request.mock.calls[0][2].jsonBody.params.arguments).toMatchObject({
+      tool_version: "2.4.0",
+      tool_digest: "sha256:" + "ab".repeat(32),
+    });
+
+    request.mockClear();
+    await client.getRuntimeReadiness();
+    expect(request).toHaveBeenCalledWith("GET", "/health/readiness");
+
+    request.mockClear();
+    await client.getBehavioralSummary("tenant-1", 5000);
+    expect(request).toHaveBeenCalledWith("GET", "/trust/behavior-summary?limit=1000", {
+      tenantId: "tenant-1",
+      useBearer: false,
+      extraHeaders: { "X-Service-Token": "service-token" },
+    });
+
+    client.unregisterToolProvenance("crm.update", "custom");
     client.close();
   });
 });

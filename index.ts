@@ -15,6 +15,7 @@ import {
 } from 'node:crypto';
 import http from 'node:http';
 import https from 'node:https';
+import packageMetadata from './package.json';
 
 type TenantId = string | number;
 type Dict = Record<string, any>;
@@ -22,6 +23,7 @@ type Dict = Record<string, any>;
 const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504]);
 const RETRYABLE_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']);
 export const IDENTITY_CONTEXT_VERSION = 'agenticdome.identity.v1';
+export const SDK_VERSION = packageMetadata.version;
 
 function b64url(data: Buffer): string {
   return data.toString('base64url');
@@ -231,26 +233,34 @@ function dropNone<T extends Dict>(data: T): Dict {
   return out;
 }
 
-export class AgentGuardError extends Error {
+export class AgenticDomeError extends Error {
   constructor(message: string) {
     super(message);
-    this.name = 'AgentGuardError';
+    this.name = 'AgenticDomeError';
   }
 }
 
-export class AgentGuardHTTPError extends AgentGuardError {
+export class AgenticDomeHTTPError extends AgenticDomeError {
   public readonly statusCode: number;
   public readonly responseText: string;
 
   constructor(statusCode: number, message: string, responseText = '') {
     super(`[${statusCode}] ${message}`);
-    this.name = 'AgentGuardHTTPError';
+    this.name = 'AgenticDomeHTTPError';
     this.statusCode = statusCode;
     this.responseText = responseText;
   }
 }
 
-export interface AgentGuardClientOptions {
+export interface ToolProvenance {
+  toolVersion?: string;
+  toolDigest?: string;
+  version?: string;
+  digest?: string;
+  toolPlatform?: string;
+}
+
+export interface AgenticDomeClientOptions {
   apiKey?: string;
   tenantId?: TenantId;
   bearerToken?: string;
@@ -258,6 +268,8 @@ export interface AgentGuardClientOptions {
   userAgent?: string;
   maxRetries?: number;
   executionBrokerMode?: 'off' | 'observe' | 'enforce';
+  serviceToken?: string;
+  toolProvenance?: Record<string, ToolProvenance>;
 }
 
 interface RequestOptions {
@@ -469,7 +481,7 @@ export interface ScenarioOptions {
   tenantId?: TenantId;
 }
 
-export class AgentGuardClient {
+export class AgenticDomeClient {
   private readonly apiBase: string;
   private readonly apiKey: string;
   private readonly tenantId?: string;
@@ -478,21 +490,24 @@ export class AgentGuardClient {
   private readonly userAgent: string;
   private readonly maxRetries: number;
   private readonly executionBrokerMode: 'off' | 'observe' | 'enforce';
+  private readonly serviceToken?: string;
+  private readonly toolProvenance = new Map<string, { toolVersion?: string; toolDigest?: string }>();
   private readonly api: AxiosInstance;
   private readonly httpAgent: http.Agent;
   private readonly httpsAgent: https.Agent;
 
-  constructor(apiBase: string, options: AgentGuardClientOptions = {}) {
-    this.apiBase = apiBase.replace(/\/+$/, '');
-    this.apiKey = options.apiKey || process.env.AGENTGUARD_API_KEY || '';
+  constructor(apiBase = process.env.AGENTICDOME_API_BASE || '', options: AgenticDomeClientOptions = {}) {
+    this.apiBase = this.requireNonempty('apiBase', apiBase).replace(/\/+$/, '');
+    this.apiKey = options.apiKey || process.env.AGENTICDOME_API_KEY || '';
     this.tenantId =
       options.tenantId !== undefined
         ? String(options.tenantId)
-        : process.env.AGENTGUARD_TENANT_ID;
+        : process.env.AGENTICDOME_TENANT_ID;
     this.bearerToken =
-      options.bearerToken || process.env.AGENTGUARD_BEARER_TOKEN;
+      options.bearerToken || process.env.AGENTICDOME_BEARER_TOKEN;
+    this.serviceToken = options.serviceToken || process.env.AGENTICDOME_SERVICE_TOKEN || process.env.SERVICE_SECRET;
     this.timeout = options.timeout ?? 20;
-    this.userAgent = options.userAgent ?? 'agenticdome-sdk/0.6.0';
+    this.userAgent = options.userAgent ?? ("agenticdome-sdk/" + SDK_VERSION);
     this.maxRetries = options.maxRetries ?? 3;
     const brokerMode = String(
       options.executionBrokerMode ?? process.env.AGENTICDOME_EXECUTION_BROKER_MODE ?? 'off',
@@ -501,6 +516,9 @@ export class AgentGuardClient {
       throw new Error('executionBrokerMode must be off, observe, or enforce');
     }
     this.executionBrokerMode = brokerMode as 'off' | 'observe' | 'enforce';
+    for (const [toolName, provenance] of Object.entries(options.toolProvenance || {})) {
+      this.registerToolProvenance(toolName, provenance);
+    }
 
     this.httpAgent = new http.Agent({
       keepAlive: true,
@@ -584,6 +602,66 @@ export class AgentGuardClient {
     if (value === undefined || value === null) return undefined;
     const s = String(value).trim();
     return s || undefined;
+  }
+
+  registerToolProvenance(toolName: string, provenance: ToolProvenance): void {
+    const name = this.requireNonempty("toolName", toolName);
+    const version = this.normalizeOptionalString(provenance.toolVersion ?? provenance.version);
+    const digest = this.normalizeOptionalString(provenance.toolDigest ?? provenance.digest);
+    const platform = this.normalizeOptionalString(provenance.toolPlatform);
+    if (digest && !/^sha256:[0-9a-f]{64}$/.test(digest)) {
+      throw new Error("toolDigest must be sha256 followed by 64 lowercase hexadecimal characters");
+    }
+    if (!version && !digest) {
+      throw new Error("toolVersion or toolDigest is required");
+    }
+    this.toolProvenance.set(platform ? platform + ":" + name : name, {
+      toolVersion: version,
+      toolDigest: digest,
+    });
+  }
+
+  unregisterToolProvenance(toolName: string, toolPlatform?: string): void {
+    const name = this.requireNonempty("toolName", toolName);
+    const platform = this.normalizeOptionalString(toolPlatform);
+    this.toolProvenance.delete(platform ? platform + ":" + name : name);
+  }
+
+  private resolveToolProvenance(options: {
+    toolName?: string;
+    toolVersion?: string;
+    toolDigest?: string;
+    toolPlatform?: string;
+    policyContext?: Dict;
+  }): { toolVersion?: string; toolDigest?: string } {
+    const name = this.normalizeOptionalString(options.toolName);
+    if (!name) return { toolVersion: options.toolVersion, toolDigest: options.toolDigest };
+    const context = options.policyContext || {};
+    const contextProvenance = context.tool_provenance && typeof context.tool_provenance === "object"
+      ? context.tool_provenance as Dict
+      : {};
+    const platform = this.normalizeOptionalString(options.toolPlatform);
+    const registered = (platform ? this.toolProvenance.get(platform + ":" + name) : undefined)
+      ?? this.toolProvenance.get(name)
+      ?? {};
+    const toolVersion = this.normalizeOptionalString(
+      options.toolVersion
+      ?? context.tool_version
+      ?? contextProvenance.tool_version
+      ?? contextProvenance.version
+      ?? registered.toolVersion,
+    );
+    const toolDigest = this.normalizeOptionalString(
+      options.toolDigest
+      ?? context.tool_digest
+      ?? contextProvenance.tool_digest
+      ?? contextProvenance.digest
+      ?? registered.toolDigest,
+    );
+    if (toolDigest && !/^sha256:[0-9a-f]{64}$/.test(toolDigest)) {
+      throw new Error("toolDigest must be sha256 followed by 64 lowercase hexadecimal characters");
+    }
+    return { toolVersion, toolDigest };
   }
 
   private normalizeDirection(direction?: string): 'input' | 'output' {
@@ -705,7 +783,7 @@ export class AgentGuardClient {
       try {
         return JSON.parse(text);
       } catch (err) {
-        throw new AgentGuardError(
+        throw new AgenticDomeError(
           `Failed to decode JSON response from ${url}: ${
             err instanceof Error ? err.message : String(err)
           }`,
@@ -720,7 +798,7 @@ export class AgentGuardClient {
       try {
         return JSON.parse(text);
       } catch (err) {
-        throw new AgentGuardError(
+        throw new AgenticDomeError(
           `Failed to decode JSON response from ${url}: ${
             err instanceof Error ? err.message : String(err)
           }`,
@@ -732,7 +810,7 @@ export class AgentGuardClient {
       return data as Dict;
     }
 
-    throw new AgentGuardError(
+    throw new AgenticDomeError(
       `Failed to decode JSON response from ${url}: unsupported response type`,
     );
   }
@@ -791,11 +869,11 @@ export class AgentGuardClient {
           continue;
         }
 
-        throw new AgentGuardHTTPError(response.status, message, responseText);
+        throw new AgenticDomeHTTPError(response.status, message, responseText);
       } catch (error) {
         lastError = error;
 
-        if (error instanceof AgentGuardHTTPError) {
+        if (error instanceof AgenticDomeHTTPError) {
           throw error;
         }
 
@@ -808,29 +886,43 @@ export class AgentGuardClient {
         if (axios.isAxiosError(error)) {
           if (error.response) {
             const message = parseErrorMessage(error.response.data, error.message);
-            throw new AgentGuardHTTPError(
+            throw new AgenticDomeHTTPError(
               error.response.status,
               message,
               toText(error.response.data),
             );
           }
 
-          throw new AgentGuardError(
+          throw new AgenticDomeError(
             `Request failed for ${url}: ${error.message}`,
           );
         }
 
         throw error instanceof Error
           ? error
-          : new AgentGuardError(`Request failed for ${url}: ${String(error)}`);
+          : new AgenticDomeError(`Request failed for ${url}: ${String(error)}`);
       }
     }
 
-    throw new AgentGuardError(
+    throw new AgenticDomeError(
       `Request failed for ${url}: ${
         lastError instanceof Error ? lastError.message : String(lastError)
       }`,
     );
+  }
+
+  private async protectedRequest(
+    method: Method,
+    path: string,
+    options: RequestOptions = {},
+  ): Promise<Dict> {
+    return this.request(method, path, {
+      ...options,
+      useBearer: !this.serviceToken && Boolean(this.bearerToken),
+      extraHeaders: this.serviceToken
+        ? { ...(options.extraHeaders || {}), "X-Service-Token": this.serviceToken }
+        : options.extraHeaders,
+    });
   }
 
   // ------------------------------------------------------------------
@@ -1005,6 +1097,8 @@ export class AgentGuardClient {
       userId: options.userId,
     });
 
+    Object.assign(options, this.resolveToolProvenance(options));
+
     const mergedPolicyContext = this.mergePolicyContext(options.policyContext, {
       agent_id: options.agentId,
       platform: options.platform,
@@ -1110,7 +1204,7 @@ export class AgentGuardClient {
       const broker = response.broker && typeof response.broker === 'object' ? response.broker : {};
       const verified = Boolean(broker.verified && broker.token_consumed);
       if ((options.executionBroker === true || this.executionBrokerMode === 'enforce') && !verified) {
-        throw new AgentGuardError('AgenticDome execution broker did not return a verified, atomically consumed decision');
+        throw new AgenticDomeError('AgenticDome execution broker did not return a verified, atomically consumed decision');
       }
     }
     return response;
@@ -1119,7 +1213,7 @@ export class AgentGuardClient {
   enforcementHeaders(result: Dict, workloadId?: string): Record<string, string> {
     const receipt = String(result.execution_receipt ?? '').trim();
     if (!receipt) {
-      throw new AgentGuardError('Broker result does not contain an execution receipt');
+      throw new AgenticDomeError('Broker result does not contain an execution receipt');
     }
     const headers: Record<string, string> = {
       'X-AgenticDome-Execution-Receipt': receipt,
@@ -1132,6 +1226,10 @@ export class AgentGuardClient {
       headers['X-AgenticDome-Workload-Id'] = normalized;
     }
     return headers;
+  }
+
+  async getRuntimeReadiness(): Promise<Dict> {
+    return this.request("GET", "/health/readiness");
   }
 
   async guardrailCheck(
@@ -1231,7 +1329,7 @@ export class AgentGuardClient {
       isAgent ? 'true' : 'false'
     }`;
 
-    return this.request('GET', path, { tenantId });
+    return this.protectedRequest('GET', path, { tenantId });
   }
 
   async getBehavioralAttestation(
@@ -1239,11 +1337,16 @@ export class AgentGuardClient {
     tenantId?: TenantId,
   ): Promise<Dict> {
     this.requireNonempty('agent_id', agentId);
-    return this.request('GET', `/trust/behavior/${encodeURIComponent(agentId)}`, { tenantId });
+    return this.protectedRequest('GET', `/trust/behavior/${encodeURIComponent(agentId)}`, { tenantId });
+  }
+
+  async getBehavioralSummary(tenantId?: TenantId, limit = 300): Promise<Dict> {
+    const boundedLimit = Math.max(1, Math.min(Math.trunc(limit), 1000));
+    return this.protectedRequest("GET", "/trust/behavior-summary?limit=" + boundedLimit, { tenantId });
   }
 
   async getThreatSignatureStatus(tenantId?: TenantId): Promise<Dict> {
-    return this.request('GET', '/security/threat-signatures/status', { tenantId });
+    return this.protectedRequest('GET', '/security/threat-signatures/status', { tenantId });
   }
 
   async reportIncident(
@@ -1255,7 +1358,7 @@ export class AgentGuardClient {
     isAgent = true,
     platform?: string,
   ): Promise<Dict> {
-    return this.request('POST', '/trust/report', {
+    return this.protectedRequest('POST', '/trust/report', {
       tenantId,
       jsonBody: {
         agent_id: agentId,
@@ -1275,7 +1378,7 @@ export class AgentGuardClient {
     tenantId?: TenantId,
     isAgent = true,
   ): Promise<Dict> {
-    const token = serviceToken || process.env.AGENTICDOME_SERVICE_TOKEN || process.env.SERVICE_SECRET;
+    const token = serviceToken || this.serviceToken;
     if (!token) {
       throw new Error('resetTrustScore requires serviceToken or AGENTICDOME_SERVICE_TOKEN');
     }
@@ -1328,6 +1431,8 @@ export class AgentGuardClient {
       sourceAgentId: options.sourceAgentId,
       sourcePlatform: options.sourcePlatform,
     });
+
+    Object.assign(options, this.resolveToolProvenance(options));
 
     const mergedPolicyContext = this.mergePolicyContext(options.policyContext, {
       agent_id: options.agentId,
@@ -1431,6 +1536,8 @@ export class AgentGuardClient {
       toolArgs: options.toolArgs,
     });
 
+    Object.assign(options, this.resolveToolProvenance(options));
+
     const payload = dropNone({
       token,
       tool_name: options.toolName,
@@ -1463,6 +1570,8 @@ export class AgentGuardClient {
       toolName: options.toolName,
       toolArgs: options.toolArgs,
     });
+
+    Object.assign(options, this.resolveToolProvenance(options));
 
     const args = dropNone({
       token,
@@ -1545,6 +1654,8 @@ export class AgentGuardClient {
       userId: options.userId,
     });
 
+    Object.assign(options, this.resolveToolProvenance(options));
+
     const mergedPolicyContext = this.mergePolicyContext(options.policyContext, {
       platform: options.platform,
       source_platform: options.sourcePlatform,
@@ -1553,6 +1664,8 @@ export class AgentGuardClient {
       user_id: options.userId,
       tool_name: options.toolName,
       tool_args: options.toolArgs,
+      tool_version: options.toolVersion,
+      tool_digest: options.toolDigest,
       reasoning_trace: options.reasoningTrace,
       request_purpose: options.requestPurpose,
       purpose: options.purpose,
@@ -1577,6 +1690,8 @@ export class AgentGuardClient {
       tool_platform: options.toolPlatform,
       tool_name: options.toolName,
       tool_args: options.toolArgs,
+      tool_version: options.toolVersion,
+      tool_digest: options.toolDigest,
       policy_context: mergedPolicyContext,
       source_agent_id: options.sourceAgentId,
       user_id: options.userId,
@@ -1744,7 +1859,4 @@ export class AgentGuardClient {
   }
 }
 
-// Backward compatibility alias
-export class GuardrailClient extends AgentGuardClient {}
-
-export default AgentGuardClient;
+export default AgenticDomeClient;
