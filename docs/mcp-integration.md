@@ -5,10 +5,11 @@ boundary. The application asks AgenticDome for an action decision immediately
 before calling its existing MCP transport, then reviews returned content before
 it re-enters an agent or model context.
 
-The TypeScript package is an API client, not an MCP proxy. It does not install
-global interception or forward traffic automatically. It also does not depend
-on or certify `@modelcontextprotocol/sdk`; keep the application's existing MCP
-transport and its version lifecycle separate.
+The TypeScript package now includes `AgenticDomeMCPGateway`, a transport-neutral
+request/response wrapper. It does not install global interception, open a proxy
+port, or choose an MCP transport. You inject the application's existing stdio,
+HTTP or SSE forwarder. The package does not depend on or certify
+`@modelcontextprotocol/sdk`; that transport lifecycle remains separate.
 
 An MCP provider may place these explicit calls in a provider-controlled tool
 dispatcher, or publish a customer-side gateway pattern. That does not protect
@@ -39,6 +40,41 @@ Redis; any backing services behind a managed sidecar are part of the managed
 runtime.
 
 ## Authorize immediately before forwarding
+
+Use the fail-closed wrapper for new integrations:
+
+```ts
+import AgenticDomeClient, { AgenticDomeMCPGateway } from 'agenticdome-sdk';
+
+const client = new AgenticDomeClient(process.env.AGENTICDOME_API_BASE!, {
+  apiKey: process.env.AGENTICDOME_API_KEY!,
+  tenantId: process.env.AGENTICDOME_TENANT_ID!,
+});
+
+// Keep your existing transport. This function is the only route to it.
+const gateway = new AgenticDomeMCPGateway(
+  client,
+  async (request) => existingMcpTransport.send(request),
+  { failClosed: true, sanitizeOutput: true },
+);
+
+const response = await gateway.forward(request, {
+  agentId: authenticatedAgent.id,
+  sessionId: trace.sessionId,
+  userId: authenticatedUser?.id,
+  mcpServerId: configuredServer.id,
+  userPrompt: currentUserPrompt,
+  policyContext: { business_purpose: approvedBusinessPurpose },
+});
+```
+
+The wrapper authorizes before the injected forwarder can run, applies sanitized
+tool arguments, filters `tools/list`, reviews text returned in MCP content, and
+fails closed by default. A blocked request never reaches the injected transport.
+Do not keep a second direct route to the upstream server.
+
+The lower-level policy methods remain available for bespoke content shapes or
+transports. The expanded example below shows those individual calls explicitly.
 
 ```ts
 import { AgenticDomeClient } from 'agenticdome-sdk';

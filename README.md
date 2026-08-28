@@ -17,7 +17,7 @@ It provides a typed API client for:
 - Multi-agent A2A decision-token verification
 - Canonical human-subject and nested agent-actor lineage
 - Single-use token consumption, lineage revocation, and RS256 proof-of-possession
-- MCP guardrail tool calls
+- MCP guardrail calls and a fail-closed transport-neutral host/gateway wrapper
 - Mesh output validation and DLP workflows
 - Agent risk and trust scoring
 - Salesforce, Microsoft, and ServiceNow scan endpoints
@@ -25,9 +25,9 @@ It provides a typed API client for:
 - Microsoft Copilot / AI Foundry threat APIs
 - Runtime readiness, signed tool-provenance status, and behavioral summaries
 
-This npm package is the low-level TypeScript client. The Python package additionally ships framework-specific adapters, the `agenticdome-demo` CLI, and the full high-level MCP host/gateway firewall. `agenticdome-openclaw-security` is the separate native OpenClaw lifecycle plugin. Those packages share the same policy protocol but intentionally expose runtime-specific integration surfaces.
+This npm package includes the core TypeScript client and `AgenticDomeMCPGateway`, a fail-closed transport-neutral MCP host/gateway wrapper. The Python package additionally ships framework-specific adapters, the onboarding CLI, and its high-level MCP host/gateway firewall. `agenticdome-openclaw-security` is the separate native OpenClaw lifecycle plugin. Those packages share the same policy protocol but intentionally expose runtime-specific integration surfaces.
 
-For MCP, `agenticdome-sdk` calls the assigned AgenticDome sidecar's MCP-shaped policy APIs. It does not forward requests to a customer MCP server, replace the application's transport, or depend on `@modelcontextprotocol/sdk`. MCP providers can use it inside a provider-controlled dispatcher, and customers can use it in a host or gateway, but each protected request must carry the correct tenant context and pass through that explicit integration boundary.
+For MCP, `AgenticDomeMCPGateway` wraps the application's injected stdio, HTTP or SSE forwarder and calls the assigned sidecar before and after forwarding. It does not open a proxy port, replace MCP OAuth or depend on `@modelcontextprotocol/sdk`. Each protected request must carry genuine tenant, actor, session, server, tool and purpose context, and all sensitive traffic must pass through that explicit boundary.
 
 ---
 
@@ -403,7 +403,27 @@ console.log(output);
 
 ## MCP JSON-RPC Integration
 
-Use the AgenticDome sidecar's MCP-shaped policy endpoint to authorize an MCP action. These methods do not forward the business request to your MCP provider; the application invokes its existing transport only after enforcing the returned verdict.
+Use `AgenticDomeMCPGateway` to wrap an existing MCP forwarder. The wrapper authorizes requests, applies sanitized arguments, filters tool discovery, reviews returned text and fails closed by default. It does not create the transport or replace MCP authentication.
+
+```ts
+import { AgenticDomeMCPGateway } from 'agenticdome-sdk';
+
+const gateway = new AgenticDomeMCPGateway(
+  client,
+  async (request) => existingMcpTransport.send(request),
+  { failClosed: true },
+);
+
+const response = await gateway.forward(request, {
+  agentId: authenticatedAgent.id,
+  sessionId: trace.sessionId,
+  userId: authenticatedUser?.id,
+  mcpServerId: configuredServer.id,
+  policyContext: { business_purpose: approvedBusinessPurpose },
+});
+```
+
+Use the lower-level MCP-shaped policy methods below only when a bespoke content shape requires manual integration. They do not forward the business request themselves.
 
 For an inline Node.js host or gateway, follow the [MCP Gateway Integration Guide](docs/mcp-integration.md). It shows where to authorize the tool request, when the existing MCP transport may run, and how to review returned content before planner reuse.
 

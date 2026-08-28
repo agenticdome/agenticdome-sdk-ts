@@ -1859,4 +1859,281 @@ export class AgenticDomeClient {
   }
 }
 
+export interface MCPJsonRpcRequest extends Dict {
+  jsonrpc: '2.0';
+  id?: string | number | null;
+  method: string;
+  params?: Dict;
+}
+
+export interface MCPJsonRpcResponse extends Dict {
+  jsonrpc: '2.0';
+  id?: string | number | null;
+  result?: unknown;
+  error?: Dict;
+}
+
+export interface MCPGatewayContext {
+  agentId: string;
+  sessionId: string;
+  mcpServerId: string;
+  userPrompt?: string;
+  requestText?: string;
+  userId?: string;
+  sourceAgentId?: string;
+  traceId?: string;
+  mcpServerUrl?: string;
+  mcpServerVendor?: string;
+  mcpServerTrustLevel?: string;
+  policyContext?: Dict;
+  tenantId?: TenantId;
+}
+
+export type MCPGatewayForwarder = (
+  request: MCPJsonRpcRequest,
+  context: MCPGatewayContext,
+) => Promise<MCPJsonRpcResponse> | MCPJsonRpcResponse;
+
+export interface MCPGatewayOptions {
+  failClosed?: boolean;
+  sanitizeOutput?: boolean;
+  authorizeUnknownMethods?: boolean;
+}
+
+/** Transport-neutral MCP request/response gateway for an existing transport. */
+export class AgenticDomeMCPGateway {
+  private readonly failClosed: boolean;
+  private readonly sanitizeOutput: boolean;
+  private readonly authorizeUnknownMethods: boolean;
+
+  constructor(
+    private readonly client: AgenticDomeClient,
+    private readonly forwarder: MCPGatewayForwarder,
+    options: MCPGatewayOptions = {},
+  ) {
+    this.failClosed = options.failClosed ?? true;
+    this.sanitizeOutput = options.sanitizeOutput ?? true;
+    this.authorizeUnknownMethods = options.authorizeUnknownMethods ?? true;
+  }
+
+  private requireContext(context: MCPGatewayContext): void {
+    for (const [name, value] of [
+      ['agentId', context.agentId],
+      ['sessionId', context.sessionId],
+      ['mcpServerId', context.mcpServerId],
+    ]) {
+      if (!String(value ?? '').trim()) {
+        throw new AgenticDomeError(`MCP gateway requires authenticated ${name} context`);
+      }
+    }
+  }
+
+  private unwrap(response: Dict): Dict {
+    return response.result && typeof response.result === 'object'
+      ? response.result as Dict
+      : response;
+  }
+
+  private verdict(response: Dict): string {
+    const body = this.unwrap(response);
+    return String(body.verdict ?? body.decision ?? body.status ?? 'UNKNOWN').toUpperCase();
+  }
+
+  private error(request: MCPJsonRpcRequest, message: string, data: Dict = {}): MCPJsonRpcResponse {
+    return {
+      jsonrpc: '2.0',
+      id: request?.id ?? null,
+      error: {
+        code: -32000,
+        message: `AgenticDome blocked MCP forwarding: ${message}`,
+        data: { method: request?.method, ...data },
+      },
+    };
+  }
+
+  private toolDetails(request: MCPJsonRpcRequest): { name: string; args: Dict } {
+    const params = request.params && typeof request.params === 'object' ? request.params : {};
+    if (request.method === 'tools/call') {
+      return {
+        name: String(params.name ?? '').trim() || 'mcp.unknown_tool',
+        args: params.arguments && typeof params.arguments === 'object' ? params.arguments : {},
+      };
+    }
+    return { name: `mcp.${request.method}`, args: params };
+  }
+
+  private policyContext(context: MCPGatewayContext, request: MCPJsonRpcRequest): Dict {
+    return {
+      ...(context.policyContext ?? {}),
+      session_id: context.sessionId,
+      trace_id: context.traceId,
+      mcp_method: request.method,
+      mcp_server_id: context.mcpServerId,
+      mcp_server_url: context.mcpServerUrl,
+      mcp_server_vendor: context.mcpServerVendor,
+      mcp_server_trust_level: context.mcpServerTrustLevel,
+    };
+  }
+
+  private sanitizedRequest(request: MCPJsonRpcRequest, decision: Dict): MCPJsonRpcRequest {
+    if (request.method !== 'tools/call') return request;
+    const body = this.unwrap(decision);
+    const sanitized = body.sanitized_tool_args ?? body.sanitized_args;
+    if (!sanitized || typeof sanitized !== 'object' || Array.isArray(sanitized)) return request;
+    return {
+      ...request,
+      params: { ...(request.params ?? {}), arguments: sanitized },
+    };
+  }
+
+  private filterTools(response: MCPJsonRpcResponse, decision: Dict): MCPJsonRpcResponse {
+    const body = this.unwrap(decision);
+    const allowed = Array.isArray(body.allowed_tools) ? new Set(body.allowed_tools.map(String)) : null;
+    const blockedValues = Array.isArray(body.blocked_tools)
+      ? body.blocked_tools
+      : Array.isArray(body.hidden_tools) ? body.hidden_tools : [];
+    const blocked = new Set(blockedValues.map(String));
+    if (!allowed && blocked.size === 0) return response;
+    const result = response.result && typeof response.result === 'object' ? response.result as Dict : null;
+    if (!result || !Array.isArray(result.tools)) return response;
+    return {
+      ...response,
+      result: {
+        ...result,
+        tools: result.tools.filter((tool: unknown) => {
+          if (!tool || typeof tool !== 'object') return false;
+          const name = String((tool as Dict).name ?? '');
+          return (!allowed || allowed.has(name)) && !blocked.has(name);
+        }),
+      },
+    };
+  }
+
+  private textContent(response: MCPJsonRpcResponse): string {
+    const result = response.result && typeof response.result === 'object' ? response.result as Dict : null;
+    const content = result && Array.isArray(result.content) ? result.content : [];
+    return content
+      .filter((item: unknown): item is Dict => Boolean(item) && typeof item === 'object')
+      .map((item: Dict) => typeof item.text === 'string' ? item.text : '')
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  private replaceText(response: MCPJsonRpcResponse, text: string): MCPJsonRpcResponse {
+    const result = response.result && typeof response.result === 'object' ? response.result as Dict : null;
+    if (!result || !Array.isArray(result.content)) return response;
+    let replaced = false;
+    return {
+      ...response,
+      result: {
+        ...result,
+        content: result.content.map((item: unknown) => {
+          if (replaced || !item || typeof item !== 'object' || typeof (item as Dict).text !== 'string') return item;
+          replaced = true;
+          return { ...(item as Dict), text };
+        }),
+      },
+    };
+  }
+
+  async preflight(
+    request: MCPJsonRpcRequest,
+    context: MCPGatewayContext,
+  ): Promise<{ request?: MCPJsonRpcRequest; decision?: Dict; blocked?: MCPJsonRpcResponse }> {
+    this.requireContext(context);
+    if (!request || request.jsonrpc !== '2.0' || !String(request.method ?? '').trim()) {
+      return { blocked: this.error(request, 'Invalid JSON-RPC request') };
+    }
+    if (!this.authorizeUnknownMethods && ![
+      'tools/call', 'tools/list', 'resources/read', 'resources/list',
+      'prompts/get', 'prompts/list', 'sampling/createMessage',
+    ].includes(request.method)) {
+      return { request };
+    }
+
+    try {
+      const tool = this.toolDetails(request);
+      const decision = await this.client.mcpGuardrailValidate({
+        text: context.userPrompt || context.requestText || request.method,
+        agentId: context.agentId,
+        sourceAgentId: context.sourceAgentId,
+        userId: context.userId,
+        direction: 'outbound',
+        platform: 'mcp',
+        toolPlatform: context.mcpServerId,
+        toolName: tool.name,
+        toolArgs: tool.args,
+        requestPurpose: `mcp_${request.method.replace(/[^a-zA-Z0-9]+/g, '_')}`,
+        policyContext: this.policyContext(context, request),
+        tenantId: context.tenantId,
+        requestId: request.id ?? '1',
+      });
+      const verdict = this.verdict(decision);
+      if (!['ALLOWED', 'REDACTED'].includes(verdict)) {
+        return { blocked: this.error(request, String(this.unwrap(decision).reason ?? verdict), { verdict }) };
+      }
+      return { request: this.sanitizedRequest(request, decision), decision };
+    } catch (error) {
+      if (!this.failClosed) return { request };
+      return { blocked: this.error(request, error instanceof Error ? error.message : String(error)) };
+    }
+  }
+
+  async forward(request: MCPJsonRpcRequest, context: MCPGatewayContext): Promise<MCPJsonRpcResponse> {
+    let preflight: { request?: MCPJsonRpcRequest; decision?: Dict; blocked?: MCPJsonRpcResponse };
+    try {
+      preflight = await this.preflight(request, context);
+    } catch (error) {
+      if (!this.failClosed) throw error;
+      return this.error(request, error instanceof Error ? error.message : String(error));
+    }
+    if (preflight.blocked) return preflight.blocked;
+    const forwardedRequest = preflight.request ?? request;
+
+    let response: MCPJsonRpcResponse;
+    try {
+      response = await this.forwarder(forwardedRequest, context);
+    } catch (error) {
+      if (!this.failClosed) throw error;
+      return this.error(request, `MCP transport failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    if (request.method === 'tools/list' && preflight.decision) {
+      response = this.filterTools(response, preflight.decision);
+    }
+    if (!this.sanitizeOutput) return response;
+
+    const text = this.textContent(response);
+    if (!text) return response;
+    try {
+      const reviewed = await this.client.meshValidate({
+        text,
+        agentId: context.agentId,
+        sourceAgentId: context.sourceAgentId,
+        userId: context.userId,
+        sessionId: context.sessionId,
+        direction: 'output',
+        platform: 'mcp',
+        redactPii: true,
+        redactSecrets: true,
+        blockOnSensitiveOutput: true,
+        tenantId: context.tenantId,
+        policyContext: {
+          ...this.policyContext(context, request),
+          request_purpose: 'mcp_output_review',
+        },
+      });
+      const verdict = this.verdict(reviewed);
+      if (!['ALLOWED', 'REDACTED'].includes(verdict)) {
+        return this.error(request, String(this.unwrap(reviewed).reason ?? verdict), { verdict, stage: 'output' });
+      }
+      const body = this.unwrap(reviewed);
+      return this.replaceText(response, String(body.sanitized_text ?? body.text ?? text));
+    } catch (error) {
+      if (!this.failClosed) return response;
+      return this.error(request, `MCP output review failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+}
+
 export default AgenticDomeClient;

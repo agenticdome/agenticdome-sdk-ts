@@ -1,6 +1,7 @@
 import { createHash, createPublicKey, verify } from 'node:crypto';
 
 import AgenticDomeClient, {
+  AgenticDomeMCPGateway,
   createDpopProof,
   generateRsaProofKey,
 } from '../index';
@@ -230,6 +231,87 @@ describe('AgenticDome protocol v2', () => {
     });
 
     client.unregisterToolProvenance("crm.update", "custom");
+    client.close();
+  });
+
+  test('MCP gateway forwards an allowed call exactly once and reviews its response', async () => {
+    const client = new AgenticDomeClient('https://sidecar.example', { apiKey: 'test-key' });
+    const mcpGuardrailValidate = jest.fn().mockResolvedValue({ verdict: 'ALLOWED' });
+    const meshValidate = jest.fn().mockResolvedValue({ verdict: 'REDACTED', sanitized_text: 'safe result' });
+    client.mcpGuardrailValidate = mcpGuardrailValidate as any;
+    client.meshValidate = meshValidate as any;
+    const forwarder = jest.fn().mockResolvedValue({
+      jsonrpc: '2.0', id: 7, result: { content: [{ type: 'text', text: 'unsafe result' }] },
+    });
+    const gateway = new AgenticDomeMCPGateway(client, forwarder);
+
+    const response = await gateway.forward(
+      { jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'crm.lookup', arguments: { id: '123' } } },
+      { agentId: 'support-agent', sessionId: 'session-1', mcpServerId: 'crm-mcp', userId: 'alice' },
+    );
+
+    expect(forwarder).toHaveBeenCalledTimes(1);
+    expect(mcpGuardrailValidate).toHaveBeenCalledWith(expect.objectContaining({
+      toolName: 'crm.lookup', toolArgs: { id: '123' }, agentId: 'support-agent', userId: 'alice',
+    }));
+    expect(meshValidate).toHaveBeenCalledTimes(1);
+    expect((response.result as any).content[0].text).toBe('safe result');
+    client.close();
+  });
+
+  test('MCP gateway never forwards a blocked call', async () => {
+    const client = new AgenticDomeClient('https://sidecar.example', { apiKey: 'test-key' });
+    client.mcpGuardrailValidate = jest.fn().mockResolvedValue({ verdict: 'BLOCKED', reason: 'policy denied' }) as any;
+    const forwarder = jest.fn();
+    const gateway = new AgenticDomeMCPGateway(client, forwarder);
+
+    const response = await gateway.forward(
+      { jsonrpc: '2.0', id: 8, method: 'tools/call', params: { name: 'billing.refund', arguments: { amount: 5000 } } },
+      { agentId: 'support-agent', sessionId: 'session-2', mcpServerId: 'billing-mcp' },
+    );
+
+    expect(forwarder).not.toHaveBeenCalled();
+    expect(response.error?.code).toBe(-32000);
+    client.close();
+  });
+
+  test('MCP gateway filters tool discovery using the sidecar decision', async () => {
+    const client = new AgenticDomeClient('https://sidecar.example', { apiKey: 'test-key' });
+    client.mcpGuardrailValidate = jest.fn().mockResolvedValue({
+      verdict: 'ALLOWED', allowed_tools: ['crm.lookup'], blocked_tools: ['admin.delete'],
+    }) as any;
+    const gateway = new AgenticDomeMCPGateway(client, jest.fn().mockResolvedValue({
+      jsonrpc: '2.0', id: 9, result: { tools: [{ name: 'crm.lookup' }, { name: 'admin.delete' }] },
+    }));
+
+    const response = await gateway.forward(
+      { jsonrpc: '2.0', id: 9, method: 'tools/list', params: {} },
+      { agentId: 'support-agent', sessionId: 'session-3', mcpServerId: 'crm-mcp' },
+    );
+
+    expect((response.result as any).tools).toEqual([{ name: 'crm.lookup' }]);
+    client.close();
+  });
+
+  test('MCP gateway fails closed when policy is unavailable or identity context is incomplete', async () => {
+    const client = new AgenticDomeClient('https://sidecar.example', { apiKey: 'test-key' });
+    client.mcpGuardrailValidate = jest.fn().mockRejectedValue(new Error('sidecar unavailable')) as any;
+    const forwarder = jest.fn();
+    const gateway = new AgenticDomeMCPGateway(client, forwarder);
+    const request = { jsonrpc: '2.0' as const, id: 10, method: 'tools/call', params: { name: 'crm.lookup' } };
+
+    const unavailable = await gateway.forward(
+      request,
+      { agentId: 'support-agent', sessionId: 'session-4', mcpServerId: 'crm-mcp' },
+    );
+    const incomplete = await gateway.forward(
+      request,
+      { agentId: '', sessionId: 'session-4', mcpServerId: 'crm-mcp' },
+    );
+
+    expect(unavailable.error?.message).toContain('sidecar unavailable');
+    expect(incomplete.error?.message).toContain('agentId');
+    expect(forwarder).not.toHaveBeenCalled();
     client.close();
   });
 });
