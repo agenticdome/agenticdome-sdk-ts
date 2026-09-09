@@ -1,6 +1,6 @@
 {
   "name": "agenticdome-sdk",
-  "version": "0.6.7",
+  "version": "0.6.8",
   "description": "Official TypeScript SDK for the AgenticDome action firewall, runtime guardrails, tool authorization, trust, A2A, and MCP APIs",
   "author": "AgenticDome",
   "license": "Apache-2.0",
@@ -64,7 +64,8 @@
     "node": ">=18"
   },
   "overrides": {
-    "esbuild": "^0.28.1"
+    "esbuild": "^0.28.1",
+    "js-yaml": "3.15.2"
   },
   "publishConfig": {
     "access": "public"

@@ -25,6 +25,109 @@ const RETRYABLE_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']);
 export const IDENTITY_CONTEXT_VERSION = 'agenticdome.identity.v1';
 export const SDK_VERSION = packageMetadata.version;
 
+export type VerifiedOperationType = 'application_action' | 'data_access' | 'delegation' | 'function_call' | 'mcp_operation' | 'model_request' | 'network_request' | 'process_execution' | 'tool_call' | 'unknown';
+export type VerifiedActorType = 'agent' | 'function' | 'human' | 'process' | 'service' | 'tool' | 'unknown';
+export type VerifiedTargetType = 'database' | 'filesystem' | 'llm' | 'mcp' | 'process' | 'service' | 'tool' | 'unknown';
+
+export interface VerifiedActionContext {
+  chainId: string; actionId: string; parentActionId?: string;
+  operationType: VerifiedOperationType; initiatorType: VerifiedActorType;
+  executorType: VerifiedActorType; targetType: VerifiedTargetType;
+  toolName?: string; toolVersion?: string; argumentsSha256?: string; destinationSha256?: string;
+}
+
+/** Privacy-bounded, non-blocking lifecycle evidence reporter.
+ * Authorization remains on the assigned runtime. Evidence requires a separate
+ * portal token scoped only to evidence:write and never includes raw arguments.
+ */
+export class VerifiedActionReporter {
+  private readonly client?: AxiosInstance;
+  private readonly tenantId: string;
+  private pending = 0;
+  private delivery: Promise<void> = Promise.resolve();
+  private readonly maxPending: number;
+
+  constructor(options: { portal?: string; evidenceToken?: string; tenantId?: string | number; timeoutMs?: number; maxPending?: number } = {}) {
+    const portal = String(options.portal || process.env.AGENTICDOME_EVIDENCE_API_BASE || '').replace(/\/$/, '');
+    const evidenceToken = String(options.evidenceToken || process.env.AGENTICDOME_EVIDENCE_TOKEN || '');
+    this.tenantId = String(options.tenantId || process.env.AGENTICDOME_TENANT_ID || '');
+    this.maxPending = Math.max(16, Math.min(Number(options.maxPending || 256), 4096));
+    if (portal && evidenceToken && this.tenantId) {
+      this.client = axios.create({ baseURL: portal, timeout: Math.max(1000, Math.min(Number(options.timeoutMs || 5000), 30000)), headers: { Authorization: `Bearer ${evidenceToken}`, 'Content-Type': 'application/json', Accept: 'application/json' } });
+    }
+  }
+
+  get enabled(): boolean { return Boolean(this.client); }
+
+  createContext(options: { operationType: VerifiedOperationType; toolName?: string; toolVersion?: string; arguments?: unknown; destination?: string; chainId?: string; actionId?: string; parentActionId?: string; initiatorType?: VerifiedActorType; executorType?: VerifiedActorType; targetType?: VerifiedTargetType }): VerifiedActionContext {
+    const digest = (value: unknown): string | undefined => value == null || value === '' ? undefined : createHash('sha256').update(typeof value === 'string' ? value : JSON.stringify(stableIdentityValue(value))).digest('hex');
+    return {
+      chainId: String(options.chainId || `vac-${randomUUID()}`).slice(0, 128), actionId: String(options.actionId || `act-${randomUUID()}`).slice(0, 128),
+      parentActionId: options.parentActionId ? String(options.parentActionId).slice(0, 128) : undefined,
+      operationType: options.operationType, initiatorType: options.initiatorType || 'agent', executorType: options.executorType || 'tool', targetType: options.targetType || 'tool',
+      toolName: options.toolName?.slice(0, 255), toolVersion: options.toolVersion?.slice(0, 128), argumentsSha256: digest(options.arguments), destinationSha256: digest(options.destination),
+    };
+  }
+
+  phase(context: VerifiedActionContext, phase: 'requested' | 'authorised' | 'admitted' | 'attempted', status: string = phase, options: { decisionReference?: string; policyIdentifier?: string; policyDigest?: string } = {}): void {
+    const digest = (value?: string): string | undefined => value ? createHash('sha256').update(value).digest('hex') : undefined;
+    this.send('/api/agentguard/verified-actions/events', {
+      protocol: 'vac/1', event_id: `evt-${randomUUID()}`, chain_id: context.chainId, action_id: context.actionId,
+      parent_action_id: context.parentActionId, phase, status, occurred_at: new Date().toISOString(), actor_type: context.executorType,
+      initiator_type: context.initiatorType, executor_type: context.executorType, operation_type: context.operationType, target_type: context.targetType,
+      tool_name: context.toolName, tool_version: context.toolVersion, arguments_sha256: context.argumentsSha256, destination_sha256: context.destinationSha256,
+      decision_jti_sha256: digest(options.decisionReference), policy_identifier: options.policyIdentifier, policy_digest: digest(options.policyDigest), evidence_level: 'sdk_reported',
+      details: { initiator_type: context.initiatorType, executor_type: context.executorType, operation_type: context.operationType, target_type: context.targetType, privacy_classification: 'application_metadata' },
+    });
+  }
+
+  outcome(context: VerifiedActionContext, outcomeClass: 'not_attempted' | 'rejected' | 'accepted' | 'succeeded' | 'partially_succeeded' | 'failed' | 'rolled_back' | 'unknown', sideEffectReference?: string): void {
+    const now = new Date().toISOString();
+    this.send('/api/agentguard/verified-actions/outcomes', {
+      schema: 'agenticdome.outcome-receipt.v1', tenant_id: this.tenantId, chain_id: context.chainId, action_id: context.actionId, jti: `sdk_${randomUUID()}`,
+      outcome_class: outcomeClass, assurance_level: 'sdk_reported', authorised_action_sha256: context.argumentsSha256, observed_action_sha256: context.argumentsSha256,
+      destination_sha256: context.destinationSha256, side_effect_ref_sha256: sideEffectReference ? createHash('sha256').update(sideEffectReference).digest('hex') : undefined,
+      attempted_at: now, completed_at: now,
+    });
+  }
+
+  async run<T>(context: VerifiedActionContext, execute: () => T | Promise<T>, authorize?: () => unknown | Promise<unknown>): Promise<T> {
+    this.phase(context, 'requested', 'requested');
+    if (authorize) {
+      const decision = await authorize() as Dict;
+      const result = decision?.result && typeof decision.result === 'object' ? decision.result : decision;
+      const verdict = String(result?.verdict || '').toUpperCase();
+      const allowed = result?.allowed === true || ['ALLOW', 'ALLOWED', 'PASS', 'REDACTED'].includes(verdict);
+      this.phase(context, 'authorised', allowed ? 'allowed' : 'blocked', {
+        decisionReference: result?.jti || result?.decision_jti,
+        policyIdentifier: result?.policy_id,
+        policyDigest: result?.policy_hash,
+      });
+      if (!allowed) {
+        this.outcome(context, 'not_attempted');
+        throw new Error('AgenticDome denied the protected action before execution.');
+      }
+      this.phase(context, 'admitted', 'admitted');
+    }
+    this.phase(context, 'attempted', 'attempted');
+    try {
+      const value = await execute();
+      this.outcome(context, 'succeeded');
+      return value;
+    } catch (error) {
+      this.outcome(context, 'failed');
+      throw error;
+    }
+  }
+
+  private send(path: string, payload: Dict): void {
+    if (!this.client || this.pending >= this.maxPending) return;
+    this.pending += 1;
+    this.delivery = this.delivery.then(async () => { await this.client?.post(path, payload); })
+      .catch(() => undefined).finally(() => { this.pending -= 1; });
+  }
+}
+
 function b64url(data: Buffer): string {
   return data.toString('base64url');
 }
