@@ -370,7 +370,7 @@ export interface AgenticDomeClientOptions {
   timeout?: number; // seconds
   userAgent?: string;
   maxRetries?: number;
-  executionBrokerMode?: 'off' | 'observe' | 'enforce';
+  executionBrokerMode?: 'policy' | 'off' | 'monitor' | 'observe' | 'enforce';
   serviceToken?: string;
   toolProvenance?: Record<string, ToolProvenance>;
 }
@@ -592,7 +592,7 @@ export class AgenticDomeClient {
   private readonly timeout: number; // seconds
   private readonly userAgent: string;
   private readonly maxRetries: number;
-  private readonly executionBrokerMode: 'off' | 'observe' | 'enforce';
+  private readonly executionBrokerMode: 'policy' | 'off' | 'monitor' | 'enforce';
   private readonly serviceToken?: string;
   private readonly toolProvenance = new Map<string, { toolVersion?: string; toolDigest?: string }>();
   private readonly api: AxiosInstance;
@@ -615,10 +615,10 @@ export class AgenticDomeClient {
     const brokerMode = String(
       options.executionBrokerMode ?? process.env.AGENTICDOME_EXECUTION_BROKER_MODE ?? 'off',
     ).trim().toLowerCase();
-    if (!['off', 'observe', 'enforce'].includes(brokerMode)) {
-      throw new Error('executionBrokerMode must be off, observe, or enforce');
+    if (!['policy', 'off', 'monitor', 'observe', 'enforce'].includes(brokerMode)) {
+      throw new Error('executionBrokerMode must be policy, off, monitor, observe, or enforce');
     }
-    this.executionBrokerMode = brokerMode as 'off' | 'observe' | 'enforce';
+    this.executionBrokerMode = (brokerMode === 'observe' ? 'monitor' : brokerMode) as 'policy' | 'off' | 'monitor' | 'enforce';
     for (const [toolName, provenance] of Object.entries(options.toolProvenance || {})) {
       this.registerToolProvenance(toolName, provenance);
     }
@@ -729,6 +729,7 @@ export class AgenticDomeClient {
     const platform = this.normalizeOptionalString(toolPlatform);
     this.toolProvenance.delete(platform ? platform + ":" + name : name);
   }
+
 
   private resolveToolProvenance(options: {
     toolName?: string;
@@ -1264,9 +1265,10 @@ export class AgenticDomeClient {
     if (options.toolDigest && !/^sha256:[0-9a-f]{64}$/.test(options.toolDigest)) {
       throw new Error("'toolDigest' must be sha256 followed by 64 lowercase hexadecimal characters");
     }
+    let resolvedBrokerMode: string = options.toolName ? this.executionBrokerMode : 'off';
     const brokerEnabled = Boolean(
       options.toolName
-      && (options.executionBroker === true || ['observe', 'enforce'].includes(this.executionBrokerMode)),
+      && (options.executionBroker === true || ['policy', 'monitor', 'enforce'].includes(resolvedBrokerMode)),
     );
     if (brokerEnabled) {
       const material = [
@@ -1299,14 +1301,22 @@ export class AgenticDomeClient {
         payload.workload_id = workloadId;
       }
     }
-    const response = await this.request('POST', brokerEnabled ? '/tools/execution/authorize' : '/tools/guardrail/validate', {
+    const policyManaged = brokerEnabled && resolvedBrokerMode === 'policy' && options.executionBroker !== true;
+    const response = await this.request('POST', policyManaged ? '/tools/execution/resolve' : brokerEnabled ? '/tools/execution/authorize' : '/tools/guardrail/validate', {
       tenantId: options.tenantId,
       jsonBody: payload,
     });
     if (brokerEnabled) {
+      if (policyManaged) {
+        const contract = response.execution_broker_policy || {};
+        if (contract.schema !== 'agenticdome.execution-broker-policy.v1' || !['off', 'monitor', 'enforce'].includes(contract.mode)) {
+          throw new AgenticDomeError('Assigned sidecar did not return a valid Execution Broker policy contract');
+        }
+        resolvedBrokerMode = contract.mode;
+      }
       const broker = response.broker && typeof response.broker === 'object' ? response.broker : {};
       const verified = Boolean(broker.verified && broker.token_consumed);
-      if ((options.executionBroker === true || this.executionBrokerMode === 'enforce') && !verified) {
+      if ((options.executionBroker === true || resolvedBrokerMode === 'enforce') && !verified) {
         throw new AgenticDomeError('AgenticDome execution broker did not return a verified, atomically consumed decision');
       }
     }
@@ -1813,11 +1823,8 @@ export class AgenticDomeClient {
       allowed_destination_domains: options.allowedDestinationDomains,
     });
 
-    if (options.toolName && ['observe', 'enforce'].includes(this.executionBrokerMode)) {
-      return this.guardrailValidate({
-        ...options,
-        executionBroker: true,
-      });
+    if (options.toolName && ['policy', 'monitor', 'enforce'].includes(this.executionBrokerMode)) {
+      return this.guardrailValidate(options);
     }
 
     return this.mcpToolCall('guardrail.validate', args, {
