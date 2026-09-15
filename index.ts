@@ -424,6 +424,17 @@ export interface GuardrailValidateOptions {
   executionDestination?: string;
   executionHttpMethod?: string;
   workloadId?: string;
+  workloadUuid?: string;
+  contentParts?: Array<{
+    modality: 'text' | 'json' | 'code' | 'document' | 'image' | 'audio' | 'video';
+    mime_type?: string;
+    content_sha256?: string;
+    byte_size?: number;
+    text?: string;
+    transcript?: string;
+    labels?: string[];
+    source?: string;
+  }>;
   policyContext?: Dict;
   reasoningTrace?: string;
   agentInstanceId?: string;
@@ -1260,11 +1271,17 @@ export class AgenticDomeClient {
       trusted_destination_domains: options.trustedDestinationDomains,
       allowed_destination_domains: options.allowedDestinationDomains,
       attachments: options.attachments,
+      content_parts: options.contentParts,
     });
 
     if (options.toolDigest && !/^sha256:[0-9a-f]{64}$/.test(options.toolDigest)) {
       throw new Error("'toolDigest' must be sha256 followed by 64 lowercase hexadecimal characters");
     }
+    const workloadUuid = (options.workloadUuid ?? process.env.AGENTICDOME_WORKLOAD_UUID ?? '').trim();
+    if (workloadUuid && !/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/.test(workloadUuid)) {
+      throw new Error("'workloadUuid' must be a UUID from AgenticDome onboarding");
+    }
+    if (workloadUuid) payload.workload_uuid = workloadUuid.toLowerCase();
     let resolvedBrokerMode: string = options.toolName ? this.executionBrokerMode : 'off';
     const brokerEnabled = Boolean(
       options.toolName
@@ -1321,6 +1338,47 @@ export class AgenticDomeClient {
       }
     }
     return response;
+  }
+
+  async inspectContent(options: {
+    contentParts: GuardrailValidateOptions['contentParts'];
+    direction?: string;
+    policyContext?: Dict;
+    runtimeVerdict?: 'ALLOWED' | 'BLOCKED' | 'REDACTED';
+    workloadUuid?: string;
+    chainId?: string;
+    actionId?: string;
+    decisionRefSha256?: string;
+    tenantId?: TenantId;
+  }): Promise<Dict> {
+    if (!Array.isArray(options.contentParts) || options.contentParts.length < 1 || options.contentParts.length > 32) {
+      throw new Error("'contentParts' must contain 1-32 descriptor objects");
+    }
+    const workloadUuid = (options.workloadUuid ?? process.env.AGENTICDOME_WORKLOAD_UUID ?? '').trim();
+    if (workloadUuid && !/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/.test(workloadUuid)) {
+      throw new Error("'workloadUuid' must be a UUID from AgenticDome onboarding");
+    }
+    for (const [label, value] of [['chainId', options.chainId], ['actionId', options.actionId]] as const) {
+      if (value !== undefined && !/^[A-Za-z0-9._:-]{1,128}$/.test(value)) {
+        throw new Error(`'${label}' must be a bounded action reference`);
+      }
+    }
+    if (options.decisionRefSha256 !== undefined && !/^[0-9a-f]{64}$/.test(options.decisionRefSha256)) {
+      throw new Error("'decisionRefSha256' must contain 64 lowercase hexadecimal characters");
+    }
+    return this.request('POST', '/mesh/content/inspect', {
+      tenantId: options.tenantId,
+      jsonBody: dropNone({
+        direction: this.normalizeDirection(options.direction ?? 'output'),
+        content_parts: options.contentParts,
+        policy_context: options.policyContext ?? {},
+        runtime_verdict: options.runtimeVerdict ?? 'ALLOWED',
+        workload_uuid: workloadUuid ? workloadUuid.toLowerCase() : undefined,
+        chain_id: options.chainId,
+        action_id: options.actionId,
+        decision_ref_sha256: options.decisionRefSha256,
+      }),
+    });
   }
 
   enforcementHeaders(result: Dict, workloadId?: string): Record<string, string> {
