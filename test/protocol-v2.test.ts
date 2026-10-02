@@ -237,7 +237,9 @@ describe('AgenticDome protocol v2', () => {
   test('MCP gateway forwards an allowed call exactly once and reviews its response', async () => {
     const client = new AgenticDomeClient('https://sidecar.example', { apiKey: 'test-key' });
     const mcpGuardrailValidate = jest.fn().mockResolvedValue({ verdict: 'ALLOWED' });
-    const meshValidate = jest.fn().mockResolvedValue({ verdict: 'REDACTED', sanitized_text: 'safe result' });
+    const meshValidate = jest.fn().mockImplementation(async ({ text }) => ({
+      verdict: 'REDACTED', sanitized_text: text.replace('unsafe result', 'safe result'),
+    }));
     client.mcpGuardrailValidate = mcpGuardrailValidate as any;
     client.meshValidate = meshValidate as any;
     const forwarder = jest.fn().mockResolvedValue({
@@ -275,8 +277,193 @@ describe('AgenticDome protocol v2', () => {
     client.close();
   });
 
+  test('MCP gateway does not echo sensitive policy reasons to its caller', async () => {
+    const client = new AgenticDomeClient('https://sidecar.example', { apiKey: 'test-key' });
+    client.mcpGuardrailValidate = jest.fn().mockResolvedValue({ verdict: 'BLOCKED', reason: 'private@example.com' }) as any;
+    const gateway = new AgenticDomeMCPGateway(client, jest.fn());
+    const request = { jsonrpc: '2.0' as const, id: 10, method: 'tools/call', params: { name: 'crm.lookup', arguments: {} } };
+    const context = { agentId: 'support', sessionId: 's1', mcpServerId: 'crm' };
+    expect(JSON.stringify(await gateway.forward(request, context))).not.toContain('private@example.com');
+
+    client.mcpGuardrailValidate = jest.fn().mockResolvedValue({ verdict: 'ALLOWED' }) as any;
+    client.meshValidate = jest.fn().mockResolvedValue({ verdict: 'BLOCKED', reason: 'private@example.com' }) as any;
+    const outputGateway = new AgenticDomeMCPGateway(client, jest.fn().mockResolvedValue({ jsonrpc: '2.0', id: 10, result: {} }));
+    expect(JSON.stringify(await outputGateway.forward(request, context))).not.toContain('private@example.com');
+    client.close();
+  });
+
+  test('MCP gateway requires replacement arguments for a redacted tool call', async () => {
+    const client = new AgenticDomeClient('https://sidecar.example', { apiKey: 'test-key' });
+    const forwarder = jest.fn().mockResolvedValue({ jsonrpc: '2.0', id: 11, result: {} });
+    const gateway = new AgenticDomeMCPGateway(client, forwarder);
+    const request = { jsonrpc: '2.0' as const, id: 11, method: 'tools/call', params: { name: 'crm.export', arguments: { scope: 'all' } } };
+    const context = { agentId: 'support-agent', sessionId: 'session-5', mcpServerId: 'crm-mcp' };
+
+    client.mcpGuardrailValidate = jest.fn().mockResolvedValue({ verdict: 'REDACTED', tool_args: { scope: 'all' } }) as any;
+    const missingReplacement = await gateway.forward(request, context);
+    expect(missingReplacement.error?.code).toBe(-32000);
+    expect(forwarder).not.toHaveBeenCalled();
+
+    client.mcpGuardrailValidate = jest.fn().mockResolvedValue({ verdict: 'REDACTED', sanitized_tool_args: {} }) as any;
+    const emptyReplacement = await gateway.preflight(request, context);
+    expect(emptyReplacement.request?.params?.arguments).toEqual({});
+    await gateway.forward(request, context);
+    expect(forwarder).toHaveBeenCalledWith(expect.objectContaining({
+      params: { name: 'crm.export', arguments: {} },
+    }), context);
+    forwarder.mockClear();
+
+    const unsupportedRequest = { jsonrpc: '2.0' as const, id: 12, method: 'resources/read', params: { uri: 'file:///private.txt' } };
+    const unsupportedReplacement = await gateway.forward(unsupportedRequest, context);
+    expect(unsupportedReplacement.error?.code).toBe(-32000);
+    expect(forwarder).not.toHaveBeenCalled();
+    client.close();
+  });
+
+  test('MCP gateway withholds redacted output without one safe replacement', async () => {
+    const client = new AgenticDomeClient('https://sidecar.example', { apiKey: 'test-key' });
+    client.mcpGuardrailValidate = jest.fn().mockResolvedValue({ verdict: 'ALLOWED' }) as any;
+    client.meshValidate = jest.fn().mockResolvedValue({ verdict: 'REDACTED' }) as any;
+    const forwarder = jest.fn().mockResolvedValue({
+      jsonrpc: '2.0', id: 13, result: { content: [{ type: 'text', text: 'private@example.com' }] },
+    });
+    const gateway = new AgenticDomeMCPGateway(client, forwarder);
+    const request = { jsonrpc: '2.0' as const, id: 13, method: 'tools/call', params: { name: 'crm.lookup', arguments: {} } };
+    const context = { agentId: 'support-agent', sessionId: 'session-6', mcpServerId: 'crm-mcp' };
+
+    const missingReplacement = await gateway.forward(request, context);
+    expect(missingReplacement.error?.code).toBe(-32000);
+    expect(forwarder).toHaveBeenCalledTimes(1);
+
+    client.meshValidate = jest.fn().mockResolvedValue({ verdict: 'REDACTED', sanitized_text: 'safe' }) as any;
+    forwarder.mockResolvedValue({
+      jsonrpc: '2.0', id: 13, result: { content: [{ type: 'text', text: 'one secret' }, { type: 'text', text: 'another secret' }] },
+    });
+    const ambiguousReplacement = await gateway.forward(request, context);
+    expect(ambiguousReplacement.error?.code).toBe(-32000);
+
+    forwarder.mockResolvedValue({
+      jsonrpc: '2.0', id: 13, result: { content: [{ type: 'text', text: '' }, { type: 'text', text: 'secret' }] },
+    });
+    const emptyFirstItem = await gateway.forward(request, context);
+    expect(emptyFirstItem.error?.code).toBe(-32000);
+    client.close();
+  });
+
+  test('MCP gateway reviews structured output and text in the same result', async () => {
+    const client = new AgenticDomeClient('https://sidecar.example', { apiKey: 'test-key' });
+    client.mcpGuardrailValidate = jest.fn().mockResolvedValue({ verdict: 'ALLOWED' }) as any;
+    const meshValidate = jest.fn().mockImplementation(async ({ text }) => ({
+      verdict: 'REDACTED', sanitized_text: text.replaceAll('alice@example.com', '[REDACTED]'),
+    }));
+    client.meshValidate = meshValidate as any;
+    const forwarder = jest.fn().mockResolvedValue({
+      jsonrpc: '2.0', id: 14, result: {
+        content: [{ type: 'text', text: 'Contact alice@example.com' }],
+        structuredContent: { email: 'alice@example.com' },
+        extra: { owner: 'alice@example.com' },
+      },
+    });
+    const gateway = new AgenticDomeMCPGateway(client, forwarder);
+
+    const response = await gateway.forward(
+      { jsonrpc: '2.0', id: 14, method: 'tools/call', params: { name: 'crm.lookup', arguments: {} } },
+      { agentId: 'support-agent', sessionId: 'session-7', mcpServerId: 'crm-mcp' },
+    );
+
+    expect(meshValidate).toHaveBeenCalledTimes(1);
+    expect(meshValidate.mock.calls[0][0].text).toContain('structuredContent');
+    expect(JSON.stringify(response)).not.toContain('alice@example.com');
+    expect((response.result as any).structuredContent.email).toBe('[REDACTED]');
+    client.close();
+  });
+
+  test('MCP gateway reviews structured-only output', async () => {
+    const client = new AgenticDomeClient('https://sidecar.example', { apiKey: 'test-key' });
+    client.mcpGuardrailValidate = jest.fn().mockResolvedValue({ verdict: 'ALLOWED' }) as any;
+    const meshValidate = jest.fn().mockImplementation(async ({ text }) => ({
+      verdict: 'REDACTED', sanitized_text: text.replace('alice@example.com', '[REDACTED]'),
+    }));
+    client.meshValidate = meshValidate as any;
+    const gateway = new AgenticDomeMCPGateway(client, jest.fn().mockResolvedValue({
+      jsonrpc: '2.0', id: 15, result: { structuredContent: { email: 'alice@example.com' } },
+    }));
+
+    const response = await gateway.forward(
+      { jsonrpc: '2.0', id: 15, method: 'tools/call', params: { name: 'crm.lookup', arguments: {} } },
+      { agentId: 'support-agent', sessionId: 'session-8', mcpServerId: 'crm-mcp' },
+    );
+
+    expect(meshValidate).toHaveBeenCalledTimes(1);
+    expect((response.result as any).structuredContent.email).toBe('[REDACTED]');
+    client.close();
+  });
+
+  test('MCP booking cancel compares the authenticated member with provider-owned reservation owner', async () => {
+    const client = new AgenticDomeClient('https://sidecar.example', { apiKey: 'test-key' });
+    client.mcpGuardrailValidate = jest.fn().mockResolvedValue({ verdict: 'ALLOWED' }) as any;
+    client.meshValidate = jest.fn().mockResolvedValue({ verdict: 'ALLOWED' }) as any;
+    const forwarder = jest.fn().mockResolvedValue({ jsonrpc: '2.0', id: 16, result: {} });
+    let authenticatedMember = 'member-requester';
+    const gateway = new AgenticDomeMCPGateway(client, forwarder, {
+      failClosed: false,
+      providerActionRules: { 'booking.cancel': { action: 'cancel_booking' } },
+      resolveProviderFacts: async (_tool, args) => ({
+        reservationId: args.reservation_id as string,
+        ownerId: 'member-owner',
+        principalId: authenticatedMember,
+      }),
+    });
+    const request = { jsonrpc: '2.0' as const, id: 16, method: 'tools/call', params: {
+      name: 'booking.cancel', arguments: { reservation_id: 'res-123', owner_id: 'member-requester' },
+    } };
+    const context = { agentId: 'booking-agent', sessionId: 's1', mcpServerId: 'gym', userId: 'member-owner' };
+
+    const blocked = await gateway.forward(request, context);
+    expect(blocked.error?.code).toBe(-32000);
+    expect(forwarder).not.toHaveBeenCalled();
+
+    authenticatedMember = 'member-owner';
+    const allowed = await gateway.forward(request, { ...context, userId: 'spoofed' });
+    expect(allowed.result).toEqual({});
+    expect(forwarder).toHaveBeenCalledTimes(1);
+    const missingIntegration = new AgenticDomeMCPGateway(client, forwarder, {
+      failClosed: false, providerActionRules: { 'booking.cancel': { action: 'cancel_booking' } },
+    });
+    expect((await missingIntegration.preflight(request, context)).blocked?.error?.code).toBe(-32000);
+    client.mcpGuardrailValidate = jest.fn().mockRejectedValue(new Error('sidecar unavailable')) as any;
+    expect((await gateway.preflight(request, context)).blocked?.error?.code).toBe(-32000);
+    client.close();
+  });
+
+  test('MCP booking horizon checks the provider limit against final sanitized arguments', async () => {
+    const client = new AgenticDomeClient('https://sidecar.example', { apiKey: 'test-key' });
+    client.mcpGuardrailValidate = jest.fn().mockResolvedValue({ verdict: 'ALLOWED' }) as any;
+    const seen: unknown[] = [];
+    const gateway = new AgenticDomeMCPGateway(client, jest.fn(), {
+      providerActionRules: { 'booking.create': { action: 'create_booking' } },
+      resolveProviderFacts: async (_tool, args) => {
+        seen.push(args);
+        return { principalId: 'member-1', latestAllowedDate: '2026-10-05' };
+      },
+    });
+    const request = { jsonrpc: '2.0' as const, id: 17, method: 'tools/call', params: {
+      name: 'booking.create', arguments: { booking_date: '2026-10-10' },
+    } };
+    const context = { agentId: 'booking-agent', sessionId: 's1', mcpServerId: 'gym' };
+
+    expect((await gateway.preflight(request, context)).blocked?.error?.code).toBe(-32000);
+    client.mcpGuardrailValidate = jest.fn().mockResolvedValue({
+      verdict: 'REDACTED', sanitized_tool_args: { booking_date: '2026-10-04' },
+    }) as any;
+    expect((await gateway.preflight(request, context)).request?.params?.arguments).toEqual({ booking_date: '2026-10-04' });
+    expect(seen).toEqual([{ booking_date: '2026-10-10' }, { booking_date: '2026-10-04' }]);
+    client.close();
+  });
+
   test('MCP gateway filters tool discovery using the sidecar decision', async () => {
     const client = new AgenticDomeClient('https://sidecar.example', { apiKey: 'test-key' });
+    client.meshValidate = jest.fn().mockResolvedValue({ verdict: 'ALLOWED' }) as any;
     client.mcpGuardrailValidate = jest.fn().mockResolvedValue({
       verdict: 'ALLOWED', allowed_tools: ['crm.lookup'], blocked_tools: ['admin.delete'],
     }) as any;
@@ -290,6 +477,107 @@ describe('AgenticDome protocol v2', () => {
     );
 
     expect((response.result as any).tools).toEqual([{ name: 'crm.lookup' }]);
+    client.close();
+  });
+
+  test('MCP gateway reviews JSON-RPC sibling and error fields without changing the response shape', async () => {
+    const client = new AgenticDomeClient('https://sidecar.example', { apiKey: 'test-key' });
+    client.mcpGuardrailValidate = jest.fn().mockResolvedValue({ verdict: 'ALLOWED' }) as any;
+    client.meshValidate = jest.fn().mockImplementation(async ({ text }) => ({
+      verdict: 'REDACTED', sanitized_text: text.replaceAll('alice@example.com', '[REDACTED]'),
+    })) as any;
+    const request = { jsonrpc: '2.0' as const, id: 19, method: 'tools/call', params: { name: 'crm.lookup', arguments: {} } };
+    const context = { agentId: 'support', sessionId: 's1', mcpServerId: 'crm' };
+    const gateway = new AgenticDomeMCPGateway(client, jest.fn().mockResolvedValue({
+      jsonrpc: '2.0', id: 19, result: { structuredContent: { email: 'alice@example.com' } },
+      extension: { email: 'alice@example.com' },
+    }));
+    const reviewed = await gateway.forward(request, context);
+    expect(JSON.stringify(reviewed)).not.toContain('alice@example.com');
+    expect(reviewed.id).toBe(19);
+
+    const errors = new AgenticDomeMCPGateway(client, jest.fn().mockResolvedValue({
+      jsonrpc: '2.0', id: 19, error: { code: 400, message: 'alice@example.com' },
+    }));
+    const reviewedError = await errors.forward(request, context);
+    expect(reviewedError.error?.message).toBe('[REDACTED]');
+
+    client.meshValidate = jest.fn().mockResolvedValue({
+      verdict: 'REDACTED', sanitized_text: '{"result":{}}',
+    }) as any;
+    const malformed = await gateway.forward(request, context);
+    expect(malformed.error?.code).toBe(-32000);
+    client.close();
+  });
+
+  test('MCP gateway rejects a non-JSON-RPC forwarder response', async () => {
+    const client = new AgenticDomeClient('https://sidecar.example', { apiKey: 'test-key' });
+    client.mcpGuardrailValidate = jest.fn().mockResolvedValue({ verdict: 'ALLOWED' }) as any;
+    const gateway = new AgenticDomeMCPGateway(client, jest.fn().mockResolvedValue('alice@example.com'));
+    const response = await gateway.forward(
+      { jsonrpc: '2.0', id: 20, method: 'tools/call', params: { name: 'crm.lookup', arguments: {} } },
+      { agentId: 'support', sessionId: 's1', mcpServerId: 'crm' },
+    );
+    expect(response.error?.code).toBe(-32000);
+    expect(JSON.stringify(response)).not.toContain('alice@example.com');
+    client.close();
+  });
+
+  test('MCP output review returns its immutable JSON snapshot, not a later-mutated forwarder object', async () => {
+    const client = new AgenticDomeClient('https://sidecar.example', { apiKey: 'test-key' });
+    client.mcpGuardrailValidate = jest.fn().mockResolvedValue({ verdict: 'ALLOWED' }) as any;
+    const shared = { jsonrpc: '2.0' as const, id: 21, result: { structuredContent: { email: 'safe' } } };
+    client.meshValidate = jest.fn().mockImplementation(async () => {
+      shared.result.structuredContent.email = 'alice@example.com';
+      return { verdict: 'ALLOWED' };
+    }) as any;
+    const request = { jsonrpc: '2.0' as const, id: 21, method: 'tools/call', params: { name: 'crm.lookup', arguments: {} } };
+    const context = { agentId: 'support', sessionId: 's1', mcpServerId: 'crm' };
+    const gateway = new AgenticDomeMCPGateway(client, jest.fn().mockResolvedValue(shared));
+    const reviewed = await gateway.forward(request, context);
+    expect((reviewed.result as any).structuredContent.email).toBe('safe');
+
+    const projected = { jsonrpc: '2.0' as const, id: 21, result: { structuredContent: { email: 'alice@example.com' } },
+      toJSON: () => ({ jsonrpc: '2.0', id: 21, result: {} }) };
+    const projectionGateway = new AgenticDomeMCPGateway(client, jest.fn().mockResolvedValue(projected));
+    expect((await projectionGateway.forward(request, context)).error?.code).toBe(-32000);
+    client.close();
+  });
+
+  test('MCP gateway rejects mismatched and redacted response IDs', async () => {
+    const client = new AgenticDomeClient('https://sidecar.example', { apiKey: 'test-key' });
+    client.mcpGuardrailValidate = jest.fn().mockResolvedValue({ verdict: 'ALLOWED' }) as any;
+    const request = { jsonrpc: '2.0' as const, id: 22, method: 'tools/call', params: { name: 'crm.lookup', arguments: {} } };
+    const context = { agentId: 'support', sessionId: 's1', mcpServerId: 'crm' };
+    const mismatch = new AgenticDomeMCPGateway(client, jest.fn().mockResolvedValue({ jsonrpc: '2.0', id: 'alice@example.com', result: {} }));
+    expect((await mismatch.forward(request, context)).error?.code).toBe(-32000);
+
+    client.meshValidate = jest.fn().mockResolvedValue({
+      verdict: 'REDACTED', sanitized_text: '{"id":"[REDACTED]","result":{}}',
+    }) as any;
+    const redacted = new AgenticDomeMCPGateway(client, jest.fn().mockResolvedValue({ jsonrpc: '2.0', id: 22, result: {} }));
+    expect((await redacted.forward(request, context)).error?.code).toBe(-32000);
+    client.close();
+  });
+
+  test('MCP gateway blocks partial Mesh scans and large reviews without coverage flags', async () => {
+    const client = new AgenticDomeClient('https://sidecar.example', { apiKey: 'test-key' });
+    client.mcpGuardrailValidate = jest.fn().mockResolvedValue({ verdict: 'ALLOWED' }) as any;
+    const request = { jsonrpc: '2.0' as const, id: 23, method: 'tools/call', params: { name: 'crm.lookup', arguments: {} } };
+    const context = { agentId: 'support', sessionId: 's1', mcpServerId: 'crm' };
+    const gateway = new AgenticDomeMCPGateway(client, jest.fn().mockResolvedValue({
+      jsonrpc: '2.0', id: 23, result: { structuredContent: { email: 'alice@example.com' } },
+    }));
+    client.meshValidate = jest.fn().mockResolvedValue({
+      verdict: 'ALLOWED', context: { truncated_for_scan: true, truncated_for_echo: false },
+    }) as any;
+    expect((await gateway.forward(request, context)).error?.code).toBe(-32000);
+
+    client.meshValidate = jest.fn().mockResolvedValue({ verdict: 'ALLOWED' }) as any;
+    const largeGateway = new AgenticDomeMCPGateway(client, jest.fn().mockResolvedValue({
+      jsonrpc: '2.0', id: 23, result: { structuredContent: { value: 'a'.repeat(6500) } },
+    }));
+    expect((await largeGateway.forward(request, context)).error?.code).toBe(-32000);
     client.close();
   });
 
@@ -309,8 +597,8 @@ describe('AgenticDome protocol v2', () => {
       { agentId: '', sessionId: 'session-4', mcpServerId: 'crm-mcp' },
     );
 
-    expect(unavailable.error?.message).toContain('sidecar unavailable');
-    expect(incomplete.error?.message).toContain('agentId');
+    expect(unavailable.error?.message).toContain('MCP preflight unavailable');
+    expect(incomplete.error?.message).toContain('MCP preflight unavailable');
     expect(forwarder).not.toHaveBeenCalled();
     client.close();
   });

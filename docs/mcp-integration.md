@@ -69,141 +69,57 @@ const response = await gateway.forward(request, {
 ```
 
 The wrapper authorizes before the injected forwarder can run, applies sanitized
-tool arguments, filters `tools/list`, reviews text returned in MCP content, and
-fails closed by default. A blocked request never reaches the injected transport.
-Do not keep a second direct route to the upstream server.
+tool arguments, filters `tools/list`, and reviews the bounded JSON response
+payload together, including `content`, `structuredContent`, error data and
+sibling extension fields. A redacted replacement must be valid JSON with the
+same structure or the wrapper blocks it. It fails closed by default. Do not
+keep a second direct route to the upstream server. Opaque/base64 content,
+unwrapped routes, disabled review and explicitly fail-open review are outside
+this coverage.
+Runtime-reported partial scan or echo coverage blocks the response, as does a
+large response lacking explicit no-truncation evidence from an older sidecar.
 
-The lower-level policy methods remain available for bespoke content shapes or
-transports. The expanded example below shows those individual calls explicitly.
+The lower-level policy methods remain available for bespoke transports, but
+calling `mcpGuardrailValidate()` and scanning only `content[].text` is **not**
+equivalent to this wrapper: it can miss `structuredContent` and sibling fields.
+If you build a bespoke transport, gate the final arguments before forwarding,
+review the complete JSON response, and reject malformed or partial redacted
+replacements. Test that no alternate path bypasses those checks.
+
+### Provider-backed booking rules (opt-in)
+
+When an MCP server can access its authenticated member session and reservation
+database, configure exact tool names on the gateway:
 
 ```ts
-import { AgenticDomeClient } from 'agenticdome-sdk';
-
-type JsonObject = Record<string, unknown>;
-
-const client = new AgenticDomeClient(process.env.AGENTICDOME_API_BASE!, {
-  apiKey: process.env.AGENTICDOME_API_KEY!,
-  tenantId: process.env.AGENTICDOME_TENANT_ID!,
-});
-
-function unwrap(response: JsonObject): JsonObject {
-  return typeof response.result === 'object' && response.result !== null
-    ? response.result as JsonObject
-    : response;
-}
-
-function extractTextContent(response: JsonObject): string {
-  const result = typeof response.result === 'object' && response.result !== null
-    ? response.result as JsonObject
-    : {};
-  const content = Array.isArray(result.content) ? result.content : [];
-  return content
-    .filter((item): item is JsonObject => typeof item === 'object' && item !== null)
-    .map((item) => typeof item.text === 'string' ? item.text : '')
-    .filter(Boolean)
-    .join('\n');
-}
-
-function replaceTextContent(response: JsonObject, sanitizedText: string): JsonObject {
-  const copy = structuredClone(response);
-  const result = typeof copy.result === 'object' && copy.result !== null
-    ? copy.result as JsonObject
-    : null;
-  if (!result || !Array.isArray(result.content)) return copy;
-
-  let replaced = false;
-  result.content = result.content.map((item) => {
-    if (replaced || typeof item !== 'object' || item === null || typeof (item as JsonObject).text !== 'string') {
-      return item;
+const gateway = new AgenticDomeMCPGateway(client, forwardToMcpServer, {
+  providerActionRules: {
+    'booking.cancel': { action: 'cancel_booking' },
+    'booking.create': { action: 'create_booking' },
+  },
+  resolveProviderFacts: async (toolName, finalArgs) => {
+    // These provider-owned interfaces are illustrative, not SDK APIs.
+    // Bind the resolver to the authenticated server request scope.
+    const memberId = serverSession.requireAuthenticatedMemberId();
+    if (toolName === 'booking.cancel') {
+      const reservation = await bookingStore.get(finalArgs.reservation_id);
+      return { principalId: memberId, reservationId: reservation.id, ownerId: reservation.memberId };
     }
-    replaced = true;
-    return { ...(item as JsonObject), text: sanitizedText };
-  });
-  return copy;
-}
-
-// Supply your existing MCP client/transport implementation here.
-declare function forwardToMcpServer(request: JsonObject): Promise<JsonObject>;
-
-export async function forwardProtectedMcpTool(
-  request: {
-    jsonrpc: '2.0';
-    id: string | number;
-    method: 'tools/call';
-    params: { name: string; arguments?: JsonObject };
+    return { principalId: memberId, latestAllowedDate: await bookingStore.latestAllowedLocalDate(memberId) };
   },
-  context: {
-    sessionId: string;
-    userId?: string;
-    sourceAgentId?: string;
-    userPrompt: string;
-    mcpServerId: string;
-  },
-): Promise<JsonObject> {
-  const decisionResponse = await client.mcpGuardrailValidate({
-    text: context.userPrompt,
-    agentId: 'typescript-mcp-gateway',
-    sourceAgentId: context.sourceAgentId,
-    userId: context.userId,
-    direction: 'outbound',
-    platform: 'mcp',
-    toolPlatform: context.mcpServerId,
-    toolName: request.params.name,
-    toolArgs: request.params.arguments ?? {},
-    requestPurpose: 'mcp_tool_execution',
-    policyContext: {
-      session_id: context.sessionId,
-      mcp_server_id: context.mcpServerId,
-    },
-  });
-
-  const decision = unwrap(decisionResponse);
-  const verdict = String(decision.verdict ?? decision.decision ?? 'UNKNOWN').toUpperCase();
-  if (verdict === 'BLOCKED' || verdict === 'ERROR' || verdict === 'UNKNOWN') {
-    throw new Error(`AgenticDome blocked MCP forwarding: ${String(decision.reason ?? verdict)}`);
-  }
-
-  // This is the application's existing MCP transport. Do not retain a second
-  // direct route for sensitive tools.
-  const response = await forwardToMcpServer(request);
-
-  const returnedText = extractTextContent(response);
-  if (!returnedText) return response;
-
-  const outputResponse = await client.meshValidate({
-    agentId: 'typescript-mcp-gateway',
-    sourceAgentId: context.sourceAgentId,
-    userId: context.userId,
-    sessionId: context.sessionId,
-    direction: 'output',
-    platform: 'mcp',
-    text: returnedText,
-    redactPii: true,
-    redactSecrets: true,
-    policyContext: {
-      request_purpose: 'mcp_tool_output_review',
-      mcp_server_id: context.mcpServerId,
-      tool_name: request.params.name,
-    },
-  });
-
-  const output = unwrap(outputResponse);
-  const outputVerdict = String(output.verdict ?? output.decision ?? 'UNKNOWN').toUpperCase();
-  if (outputVerdict === 'BLOCKED' || outputVerdict === 'ERROR' || outputVerdict === 'UNKNOWN') {
-    throw new Error(`AgenticDome blocked MCP result: ${String(output.reason ?? outputVerdict)}`);
-  }
-
-  return replaceTextContent(
-    response,
-    String(output.sanitized_text ?? output.text ?? returnedText),
-  );
-}
+});
 ```
 
-Replace the declared `forwardToMcpServer` with your existing MCP transport.
-Adapt the small extraction helpers if your server returns a different content
-shape. Preserve non-text structured fields, and replace only content the policy
-response explicitly sanitizes.
+The default final argument names are `reservation_id` and `booking_date`
+(provider-local `YYYY-MM-DD`). Set `reservationIdArgument` or
+`bookingDateArgument` for other tool schemas. The gateway blocks a cancellation
+unless the requested reservation matches the provider lookup and its owner is
+the authenticated member. It blocks a new booking past the provider's horizon.
+Missing facts or a sidecar failure also block configured booking tools, even
+with `failClosed: false`. Neither `context.userId` nor agent-provided arguments
+are proof of membership or ownership. The provider backend must still enforce
+ownership and booking limits atomically; this guard cannot protect a browser or
+API route that does not pass through it.
 
 ## Production rules
 

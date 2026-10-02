@@ -1,6 +1,6 @@
 {
   "name": "agenticdome-sdk",
-  "version": "0.6.12",
+  "version": "0.6.13",
   "description": "Official TypeScript SDK for the AgenticDome action firewall, runtime guardrails, tool authorization, trust, A2A, and MCP APIs",
   "author": "AgenticDome",
   "license": "Apache-2.0",
@@ -50,7 +50,7 @@
     "prepublishOnly": "npm run clean && npm run typecheck && npm run build"
   },
   "dependencies": {
-    "axios": "^1.19.0"
+    "axios": "^1.20.0"
   },
   "devDependencies": {
     "@types/jest": "^29.5.14",

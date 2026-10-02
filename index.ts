@@ -2066,6 +2066,24 @@ export interface MCPGatewayOptions {
   failClosed?: boolean;
   sanitizeOutput?: boolean;
   authorizeUnknownMethods?: boolean;
+  providerActionRules?: Record<string, MCPProviderActionRule>;
+  resolveProviderFacts?: (toolName: string, finalArguments: Dict) => Promise<MCPProviderActionFacts> | MCPProviderActionFacts;
+}
+
+export interface MCPProviderActionRule {
+  action: 'cancel_booking' | 'create_booking';
+  reservationIdArgument?: string;
+  bookingDateArgument?: string;
+}
+
+export interface MCPProviderActionFacts {
+  /** Derived from the provider's authenticated server session, not MCP context or tool arguments. */
+  principalId?: string;
+  /** Looked up in the provider's system of record by the exact reservation ID. */
+  reservationId?: string;
+  ownerId?: string;
+  /** Provider-local calendar date, YYYY-MM-DD. */
+  latestAllowedDate?: string;
 }
 
 /** Transport-neutral MCP request/response gateway for an existing transport. */
@@ -2073,6 +2091,8 @@ export class AgenticDomeMCPGateway {
   private readonly failClosed: boolean;
   private readonly sanitizeOutput: boolean;
   private readonly authorizeUnknownMethods: boolean;
+  private readonly providerActionRules: Record<string, MCPProviderActionRule>;
+  private readonly resolveProviderFacts?: MCPGatewayOptions['resolveProviderFacts'];
 
   constructor(
     private readonly client: AgenticDomeClient,
@@ -2082,6 +2102,8 @@ export class AgenticDomeMCPGateway {
     this.failClosed = options.failClosed ?? true;
     this.sanitizeOutput = options.sanitizeOutput ?? true;
     this.authorizeUnknownMethods = options.authorizeUnknownMethods ?? true;
+    this.providerActionRules = options.providerActionRules ?? {};
+    this.resolveProviderFacts = options.resolveProviderFacts;
   }
 
   private requireContext(context: MCPGatewayContext): void {
@@ -2104,13 +2126,18 @@ export class AgenticDomeMCPGateway {
 
   private verdict(response: Dict): string {
     const body = this.unwrap(response);
-    return String(body.verdict ?? body.decision ?? body.status ?? 'UNKNOWN').toUpperCase();
+    const value = String(body.verdict ?? body.decision ?? body.status ?? 'UNKNOWN').toUpperCase();
+    return ['ALLOWED', 'BLOCKED', 'REDACTED'].includes(value) ? value : 'UNKNOWN';
+  }
+
+  private validJsonRpcId(value: unknown): boolean {
+    return value === null || typeof value === 'string' || (typeof value === 'number' && Number.isFinite(value));
   }
 
   private error(request: MCPJsonRpcRequest, message: string, data: Dict = {}): MCPJsonRpcResponse {
     return {
       jsonrpc: '2.0',
-      id: request?.id ?? null,
+      id: this.validJsonRpcId(request?.id) ? request.id : null,
       error: {
         code: -32000,
         message: `AgenticDome blocked MCP forwarding: ${message}`,
@@ -2154,6 +2181,41 @@ export class AgenticDomeMCPGateway {
     };
   }
 
+  private validBookingDate(value: unknown): value is string {
+    if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+    const parsed = new Date(`${value}T00:00:00.000Z`);
+    return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+  }
+
+  private async providerActionAllowed(request: MCPJsonRpcRequest): Promise<boolean> {
+    if (request.method !== 'tools/call') return true;
+    const tool = this.toolDetails(request);
+    const rule = this.providerActionRules[tool.name];
+    if (!rule) return true;
+    if (!this.resolveProviderFacts) return false;
+    try {
+      // The callback is provider-owned. Never infer authentication or ownership
+      // from context.userId, policyContext, or the agent's proposed arguments.
+      const facts = await this.resolveProviderFacts(tool.name, structuredClone(tool.args));
+      if (!facts || typeof facts.principalId !== 'string' || !facts.principalId.trim()) return false;
+      if (rule.action === 'cancel_booking') {
+        const requested = tool.args[rule.reservationIdArgument ?? 'reservation_id'];
+        return typeof requested === 'string' && requested.trim().length > 0
+          && typeof facts.reservationId === 'string' && requested === facts.reservationId
+          && typeof facts.ownerId === 'string' && facts.ownerId.trim().length > 0
+          && facts.principalId === facts.ownerId;
+      }
+      if (rule.action === 'create_booking') {
+        const requested = tool.args[rule.bookingDateArgument ?? 'booking_date'];
+        return this.validBookingDate(requested) && this.validBookingDate(facts.latestAllowedDate)
+          && requested <= facts.latestAllowedDate;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
   private filterTools(response: MCPJsonRpcResponse, decision: Dict): MCPJsonRpcResponse {
     const body = this.unwrap(decision);
     const allowed = Array.isArray(body.allowed_tools) ? new Set(body.allowed_tools.map(String)) : null;
@@ -2177,31 +2239,40 @@ export class AgenticDomeMCPGateway {
     };
   }
 
-  private textContent(response: MCPJsonRpcResponse): string {
-    const result = response.result && typeof response.result === 'object' ? response.result as Dict : null;
-    const content = result && Array.isArray(result.content) ? result.content : [];
-    return content
-      .filter((item: unknown): item is Dict => Boolean(item) && typeof item === 'object')
-      .map((item: Dict) => typeof item.text === 'string' ? item.text : '')
-      .filter(Boolean)
-      .join('\n');
+  private sameOutputShape(original: unknown, replacement: unknown): boolean {
+    if (Array.isArray(original)) {
+      return Array.isArray(replacement) && original.length === replacement.length
+        && original.every((value, index) => this.sameOutputShape(value, replacement[index]));
+    }
+    if (original !== null && typeof original === 'object') {
+      if (replacement === null || typeof replacement !== 'object' || Array.isArray(replacement)) return false;
+      const keys = Object.keys(original as Dict);
+      return keys.length === Object.keys(replacement as Dict).length
+        && keys.every((key) => Object.prototype.hasOwnProperty.call(replacement, key)
+          && this.sameOutputShape((original as Dict)[key], (replacement as Dict)[key]));
+    }
+    return original === null ? replacement === null : replacement !== null && typeof original === typeof replacement;
   }
 
-  private replaceText(response: MCPJsonRpcResponse, text: string): MCPJsonRpcResponse {
-    const result = response.result && typeof response.result === 'object' ? response.result as Dict : null;
-    if (!result || !Array.isArray(result.content)) return response;
-    let replaced = false;
-    return {
-      ...response,
-      result: {
-        ...result,
-        content: result.content.map((item: unknown) => {
-          if (replaced || !item || typeof item !== 'object' || typeof (item as Dict).text !== 'string') return item;
-          replaced = true;
-          return { ...(item as Dict), text };
-        }),
-      },
-    };
+  private plainJson(value: unknown, seen = new Set<object>()): boolean {
+    if (value === null || typeof value === 'string' || typeof value === 'boolean') return true;
+    if (typeof value === 'number') return Number.isFinite(value);
+    if (typeof value !== 'object' || seen.has(value)) return false;
+    const isArray = Array.isArray(value);
+    const prototype = Object.getPrototypeOf(value);
+    if (isArray ? prototype !== Array.prototype : prototype !== Object.prototype && prototype !== null) return false;
+    if (Object.getOwnPropertyDescriptor(Object.prototype, 'toJSON')) return false;
+    seen.add(value);
+    const keys = Reflect.ownKeys(value);
+    for (const key of keys) {
+      if (isArray && key === 'length') continue;
+      if (typeof key !== 'string' || (isArray && !/^(0|[1-9]\d*)$/.test(key))) return false;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !descriptor.enumerable || !('value' in descriptor) || !this.plainJson(descriptor.value, seen)) return false;
+    }
+    if (isArray && keys.length !== value.length + 1) return false;
+    seen.delete(value);
+    return true;
   }
 
   async preflight(
@@ -2209,7 +2280,8 @@ export class AgenticDomeMCPGateway {
     context: MCPGatewayContext,
   ): Promise<{ request?: MCPJsonRpcRequest; decision?: Dict; blocked?: MCPJsonRpcResponse }> {
     this.requireContext(context);
-    if (!request || request.jsonrpc !== '2.0' || !String(request.method ?? '').trim()) {
+    if (!request || request.jsonrpc !== '2.0' || !String(request.method ?? '').trim()
+      || (request.id !== undefined && !this.validJsonRpcId(request.id))) {
       return { blocked: this.error(request, 'Invalid JSON-RPC request') };
     }
     if (!this.authorizeUnknownMethods && ![
@@ -2238,12 +2310,26 @@ export class AgenticDomeMCPGateway {
       });
       const verdict = this.verdict(decision);
       if (!['ALLOWED', 'REDACTED'].includes(verdict)) {
-        return { blocked: this.error(request, String(this.unwrap(decision).reason ?? verdict), { verdict }) };
+        return { blocked: this.error(request, 'MCP action not authorized', { verdict }) };
       }
-      return { request: this.sanitizedRequest(request, decision), decision };
+      if (verdict === 'REDACTED') {
+        const body = this.unwrap(decision);
+        const sanitized = body.sanitized_tool_args ?? body.sanitized_args;
+        if (request.method !== 'tools/call' || !sanitized || typeof sanitized !== 'object' || Array.isArray(sanitized)) {
+          return { blocked: this.error(request, 'REDACTED decision has no usable replacement arguments', { verdict }) };
+        }
+      }
+      const finalRequest = this.sanitizedRequest(request, decision);
+      if (!(await this.providerActionAllowed(finalRequest))) {
+        return { blocked: this.error(request, 'Provider-backed booking authorization failed') };
+      }
+      return { request: finalRequest, decision };
     } catch (error) {
+      if (request.method === 'tools/call' && this.providerActionRules[this.toolDetails(request).name]) {
+        return { blocked: this.error(request, 'Provider-backed booking authorization unavailable') };
+      }
       if (!this.failClosed) return { request };
-      return { blocked: this.error(request, error instanceof Error ? error.message : String(error)) };
+      return { blocked: this.error(request, 'MCP preflight unavailable') };
     }
   }
 
@@ -2253,7 +2339,7 @@ export class AgenticDomeMCPGateway {
       preflight = await this.preflight(request, context);
     } catch (error) {
       if (!this.failClosed) throw error;
-      return this.error(request, error instanceof Error ? error.message : String(error));
+      return this.error(request, 'MCP preflight unavailable');
     }
     if (preflight.blocked) return preflight.blocked;
     const forwardedRequest = preflight.request ?? request;
@@ -2263,7 +2349,25 @@ export class AgenticDomeMCPGateway {
       response = await this.forwarder(forwardedRequest, context);
     } catch (error) {
       if (!this.failClosed) throw error;
-      return this.error(request, `MCP transport failed: ${error instanceof Error ? error.message : String(error)}`);
+      return this.error(request, 'MCP transport failed');
+    }
+
+    try {
+      if (!this.plainJson(response)) throw new Error('non-JSON response');
+      // Return the exact parsed snapshot reviewed below, never a mutable
+      // forwarder-owned object or an object with a custom toJSON projection.
+      response = JSON.parse(JSON.stringify(response)) as MCPJsonRpcResponse;
+    } catch {
+      return this.error(request, 'MCP transport returned a non-JSON response');
+    }
+    if (!response || typeof response !== 'object' || Array.isArray(response) || response.jsonrpc !== '2.0') {
+      return this.error(request, 'MCP transport returned an invalid JSON-RPC response');
+    }
+    if (response.id !== undefined && !this.validJsonRpcId(response.id)) {
+      return this.error(request, 'MCP transport returned an invalid JSON-RPC ID');
+    }
+    if (request.id !== undefined && (!Object.prototype.hasOwnProperty.call(response, 'id') || response.id !== request.id)) {
+      return this.error(request, 'MCP response ID does not match the request');
     }
 
     if (request.method === 'tools/list' && preflight.decision) {
@@ -2271,8 +2375,18 @@ export class AgenticDomeMCPGateway {
     }
     if (!this.sanitizeOutput) return response;
 
-    const text = this.textContent(response);
-    if (!text) return response;
+    const payload: Dict = { ...response };
+    delete payload.jsonrpc;
+    if (Object.keys(payload).length === 0) return response;
+    let text: string;
+    try {
+      text = JSON.stringify(payload);
+      if (typeof text !== 'string' || text.length > 100_000) {
+        return this.error(request, 'MCP output exceeds the complete-review limit', { stage: 'output' });
+      }
+    } catch {
+      return this.error(request, 'MCP output is not JSON-serializable for complete review', { stage: 'output' });
+    }
     try {
       const reviewed = await this.client.meshValidate({
         text,
@@ -2292,14 +2406,39 @@ export class AgenticDomeMCPGateway {
         },
       });
       const verdict = this.verdict(reviewed);
-      if (!['ALLOWED', 'REDACTED'].includes(verdict)) {
-        return this.error(request, String(this.unwrap(reviewed).reason ?? verdict), { verdict, stage: 'output' });
-      }
       const body = this.unwrap(reviewed);
-      return this.replaceText(response, String(body.sanitized_text ?? body.text ?? text));
+      const coverage = body.context && typeof body.context === 'object' ? body.context as Dict : {};
+      if (coverage.truncated_for_scan === true || coverage.truncated_for_echo === true
+        || (text.length > 6000 && (typeof coverage.truncated_for_scan !== 'boolean'
+          || typeof coverage.truncated_for_echo !== 'boolean'))) {
+        return this.error(request, 'MCP output review was incomplete', { stage: 'output' });
+      }
+      if (!['ALLOWED', 'REDACTED'].includes(verdict)) {
+        return this.error(request, 'MCP output not authorized', { verdict, stage: 'output' });
+      }
+      if (verdict === 'REDACTED') {
+        const replacement = body.sanitized_text ?? body.text;
+        if (typeof replacement !== 'string') {
+          return this.error(request, 'REDACTED output has no safe replacement', { verdict, stage: 'output' });
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(replacement);
+        } catch {
+          return this.error(request, 'REDACTED output is not valid JSON', { verdict, stage: 'output' });
+        }
+        if (!this.sameOutputShape(payload, parsed)) {
+          return this.error(request, 'REDACTED output changed response structure', { verdict, stage: 'output' });
+        }
+        if ((parsed as Dict).id !== response.id) {
+          return this.error(request, 'REDACTED output changed the JSON-RPC request ID', { verdict, stage: 'output' });
+        }
+        return { ...response, ...(parsed as Dict) };
+      }
+      return response;
     } catch (error) {
       if (!this.failClosed) return response;
-      return this.error(request, `MCP output review failed: ${error instanceof Error ? error.message : String(error)}`);
+      return this.error(request, 'MCP output review failed');
     }
   }
 }

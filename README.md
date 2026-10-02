@@ -403,7 +403,7 @@ console.log(output);
 
 ## MCP JSON-RPC Integration
 
-Use `AgenticDomeMCPGateway` to wrap an existing MCP forwarder. The wrapper authorizes requests, applies sanitized arguments, filters tool discovery, reviews returned text and fails closed by default. It does not create the transport or replace MCP authentication.
+Use `AgenticDomeMCPGateway` to wrap an existing MCP forwarder. The wrapper authorizes requests, applies sanitized arguments, filters tool discovery, and reviews the bounded JSON response payload—including `structuredContent`, error data and sibling fields—before release. It rejects malformed redacted replacements and fails closed by default. It does not create the transport, decode opaque content or replace MCP authentication. For provider-owned booking tools, optional `providerActionRules` and `resolveProviderFacts` compare authenticated member and reservation ownership or enforce the provider's booking horizon; see the [MCP guide](docs/mcp-integration.md).
 
 ```ts
 import { AgenticDomeMCPGateway } from 'agenticdome-sdk';
