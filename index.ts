@@ -37,8 +37,8 @@ export interface VerifiedActionContext {
 }
 
 /** Privacy-bounded, non-blocking lifecycle evidence reporter.
- * Authorization remains on the assigned runtime. Evidence requires a separate
- * portal token scoped only to evidence:write and never includes raw arguments.
+ * Existing tenant SDK credentials enable reporting to the assigned runtime.
+ * Explicit portal evidence credentials remain supported. Raw content is excluded.
  */
 export class VerifiedActionReporter {
   private readonly client?: AxiosInstance;
@@ -46,18 +46,40 @@ export class VerifiedActionReporter {
   private pending = 0;
   private delivery: Promise<void> = Promise.resolve();
   private readonly maxPending: number;
+  private readonly sender?: (kind: 'events' | 'outcomes', payload: Dict) => Promise<unknown>;
+  private readonly runtimeMode: boolean;
+  private delivered = 0;
+  private failed = 0;
+  private dropped = 0;
 
-  constructor(options: { portal?: string; evidenceToken?: string; tenantId?: string | number; timeoutMs?: number; maxPending?: number } = {}) {
+  constructor(options: { portal?: string; evidenceToken?: string; tenantId?: string | number; timeoutMs?: number; maxPending?: number;
+    runtimeBase?: string; apiKey?: string; enabled?: boolean; sender?: (kind: 'events' | 'outcomes', payload: Dict) => Promise<unknown> } = {}) {
     const portal = String(options.portal || process.env.AGENTICDOME_EVIDENCE_API_BASE || '').replace(/\/$/, '');
     const evidenceToken = String(options.evidenceToken || process.env.AGENTICDOME_EVIDENCE_TOKEN || '');
     this.tenantId = String(options.tenantId || process.env.AGENTICDOME_TENANT_ID || '');
     this.maxPending = Math.max(16, Math.min(Number(options.maxPending || 256), 4096));
-    if (portal && evidenceToken && this.tenantId) {
+    this.runtimeMode = !(portal && evidenceToken);
+    if (options.enabled === false || ['false','0','off','no'].includes(String(process.env.AGENTICDOME_EVIDENCE_ENABLED || '').toLowerCase()))return;
+    const runtimeBase = String(options.runtimeBase || process.env.AGENTICDOME_API_BASE || '').replace(/\/+$/, '');
+    const apiKey = String(options.apiKey || process.env.AGENTICDOME_API_KEY || '');
+    if (!this.runtimeMode && this.tenantId) {
       this.client = axios.create({ baseURL: portal, timeout: Math.max(1000, Math.min(Number(options.timeoutMs || 5000), 30000)), headers: { Authorization: `Bearer ${evidenceToken}`, 'Content-Type': 'application/json', Accept: 'application/json' } });
+    } else if (/^https?:\/\//.test(runtimeBase) && apiKey && this.tenantId) {
+      this.sender = options.sender;
+      if (!this.sender)this.client = axios.create({baseURL: runtimeBase,timeout: options.timeoutMs || 5000,
+        headers:{'X-API-Key':apiKey,'X-Tenant-Id':this.tenantId,'Content-Type':'application/json'}});
     }
   }
 
-  get enabled(): boolean { return Boolean(this.client); }
+  get enabled(): boolean { return Boolean(this.client || this.sender); }
+  stats(): { pending: number; delivered: number; failed: number; dropped: number; enabled: boolean } {
+    return {pending:this.pending,delivered:this.delivered,failed:this.failed,dropped:this.dropped,enabled:this.enabled};
+  }
+  async flush(timeoutMs = 5000): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {return await Promise.race([this.delivery.then(()=>this.failed===0),new Promise<boolean>(resolve=>{timer=setTimeout(()=>resolve(false),timeoutMs);})]);}
+    finally {if(timer)clearTimeout(timer);}
+  }
 
   createContext(options: { operationType: VerifiedOperationType; toolName?: string; toolVersion?: string; arguments?: unknown; destination?: string; chainId?: string; actionId?: string; parentActionId?: string; initiatorType?: VerifiedActorType; executorType?: VerifiedActorType; targetType?: VerifiedTargetType }): VerifiedActionContext {
     const digest = (value: unknown): string | undefined => value == null || value === '' ? undefined : createHash('sha256').update(typeof value === 'string' ? value : JSON.stringify(stableIdentityValue(value))).digest('hex');
@@ -81,13 +103,17 @@ export class VerifiedActionReporter {
     });
   }
 
+  withArguments(context: VerifiedActionContext, args: unknown): VerifiedActionContext {
+    return {...context, argumentsSha256:createHash('sha256').update(JSON.stringify(stableIdentityValue(args))).digest('hex')};
+  }
+
   outcome(context: VerifiedActionContext, outcomeClass: 'not_attempted' | 'rejected' | 'accepted' | 'succeeded' | 'partially_succeeded' | 'failed' | 'rolled_back' | 'unknown', sideEffectReference?: string): void {
     const now = new Date().toISOString();
     this.send('/api/agentguard/verified-actions/outcomes', {
       schema: 'agenticdome.outcome-receipt.v1', tenant_id: this.tenantId, chain_id: context.chainId, action_id: context.actionId, jti: `sdk_${randomUUID()}`,
-      outcome_class: outcomeClass, assurance_level: 'sdk_reported', authorised_action_sha256: context.argumentsSha256, observed_action_sha256: context.argumentsSha256,
+      outcome_class: outcomeClass, assurance_level: 'sdk_reported', authorised_action_sha256: context.argumentsSha256, observed_action_sha256: outcomeClass==='not_attempted'?undefined:context.argumentsSha256,
       destination_sha256: context.destinationSha256, side_effect_ref_sha256: sideEffectReference ? createHash('sha256').update(sideEffectReference).digest('hex') : undefined,
-      attempted_at: now, completed_at: now,
+      completed_at: now,
     });
   }
 
@@ -121,10 +147,23 @@ export class VerifiedActionReporter {
   }
 
   private send(path: string, payload: Dict): void {
-    if (!this.client || this.pending >= this.maxPending) return;
+    if (!this.enabled)return;
+    if (this.pending >= this.maxPending) {this.dropped++;return;}
     this.pending += 1;
-    this.delivery = this.delivery.then(async () => { await this.client?.post(path, payload); })
-      .catch(() => undefined).finally(() => { this.pending -= 1; });
+    const kind = path.endsWith('/events') ? 'events' : 'outcomes';
+    this.delivery = this.delivery.then(async () => {
+      for(let attempt=0;attempt<3;attempt++){
+        try {
+          if(this.runtimeMode && this.sender)await this.sender(kind,payload);
+          else await this.client?.post(this.runtimeMode?'/mesh/evidence/'+kind:path,payload);
+          this.delivered++;return;
+        } catch(error) {
+          const status=(error as any)?.response?.status || (error as any)?.statusCode;
+          if(attempt===2 || status && !RETRYABLE_STATUS_CODES.has(status))throw error;
+          await new Promise(resolve=>setTimeout(resolve,100*2**attempt));
+        }
+      }
+    }).catch(() => {this.failed++;}).finally(() => { this.pending -= 1; });
   }
 }
 
@@ -596,6 +635,7 @@ export interface ScenarioOptions {
 }
 
 export class AgenticDomeClient {
+  readonly lifecycle: VerifiedActionReporter;
   private readonly apiBase: string;
   private readonly apiKey: string;
   private readonly tenantId?: string;
@@ -655,6 +695,8 @@ export class AgenticDomeClient {
         'User-Agent': this.userAgent,
       },
     });
+    this.lifecycle = new VerifiedActionReporter({runtimeBase:this.apiBase,apiKey:this.apiKey,tenantId:this.tenantId,
+      sender:(kind,payload)=>this.request('POST','/mesh/evidence/'+kind,{jsonBody:payload,timeout:5})});
   }
 
   // ------------------------------------------------------------------
@@ -2334,6 +2376,19 @@ export class AgenticDomeMCPGateway {
   }
 
   async forward(request: MCPJsonRpcRequest, context: MCPGatewayContext): Promise<MCPJsonRpcResponse> {
+    const lifecycle=this.client.lifecycle.createContext({operationType:'mcp_operation',toolName:request.method==='tools/call'?String(request.params?.name||'tools/call'):request.method,
+      arguments:request.params,destination:context.mcpServerId,executorType:'tool',targetType:'mcp'});
+    const scoped={...context,policyContext:{...(context.policyContext||{}),chain_id:lifecycle.chainId,action_id:lifecycle.actionId,decision_id:lifecycle.actionId}};
+    const reporter=this.client.lifecycle;reporter.phase(lifecycle,'requested');
+    const state={attempted:false,failed:false,context:lifecycle};
+    try {
+      const response=await this.forwardAction(request,scoped,lifecycle,state);
+      // JSON-RPC error is a reported rejection; a response is not destination attestation.
+      reporter.outcome(state.context,!state.attempted?'not_attempted':state.failed?'failed':response.error?'rejected':'succeeded');return response;
+    } catch(error){reporter.outcome(state.context,state.attempted?'failed':'not_attempted');throw error;}
+  }
+
+  private async forwardAction(request: MCPJsonRpcRequest, context: MCPGatewayContext, lifecycle: VerifiedActionContext, state: {attempted:boolean;failed:boolean;context:VerifiedActionContext}): Promise<MCPJsonRpcResponse> {
     let preflight: { request?: MCPJsonRpcRequest; decision?: Dict; blocked?: MCPJsonRpcResponse };
     try {
       preflight = await this.preflight(request, context);
@@ -2341,13 +2396,19 @@ export class AgenticDomeMCPGateway {
       if (!this.failClosed) throw error;
       return this.error(request, 'MCP preflight unavailable');
     }
-    if (preflight.blocked) return preflight.blocked;
+    if (preflight.blocked) {this.client.lifecycle.phase(lifecycle,'authorised','blocked');return preflight.blocked;}
     const forwardedRequest = preflight.request ?? request;
+    lifecycle=this.client.lifecycle.withArguments(lifecycle,request.method==='tools/call'?forwardedRequest.params?.arguments:forwardedRequest.params);
+    state.context=lifecycle;
+    if(preflight.decision)this.client.lifecycle.phase(lifecycle,'authorised','allowed');
+    this.client.lifecycle.phase(lifecycle,'admitted');
 
     let response: MCPJsonRpcResponse;
     try {
+      state.attempted=true;this.client.lifecycle.phase(lifecycle,'attempted');
       response = await this.forwarder(forwardedRequest, context);
     } catch (error) {
+      state.failed=true;
       if (!this.failClosed) throw error;
       return this.error(request, 'MCP transport failed');
     }

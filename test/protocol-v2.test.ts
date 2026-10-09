@@ -310,7 +310,9 @@ describe('AgenticDome protocol v2', () => {
     await gateway.forward(request, context);
     expect(forwarder).toHaveBeenCalledWith(expect.objectContaining({
       params: { name: 'crm.export', arguments: {} },
-    }), context);
+    }), expect.objectContaining({ ...context, policyContext: expect.objectContaining({
+      chain_id: expect.any(String), action_id: expect.any(String), decision_id: expect.any(String),
+    }) }));
     forwarder.mockClear();
 
     const unsupportedRequest = { jsonrpc: '2.0' as const, id: 12, method: 'resources/read', params: { uri: 'file:///private.txt' } };

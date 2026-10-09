@@ -29,6 +29,10 @@ This npm package includes the core TypeScript client and `AgenticDomeMCPGateway`
 
 For MCP, `AgenticDomeMCPGateway` wraps the application's injected stdio, HTTP or SSE forwarder and calls the assigned sidecar before and after forwarding. It does not open a proxy port, replace MCP OAuth or depend on `@modelcontextprotocol/sdk`. Each protected request must carry genuine tenant, actor, session, server, tool and purpose context, and all sensitive traffic must pass through that explicit boundary.
 
+Lifecycle evidence is enabled by default for the MCP gateway using the client's existing runtime URL, tenant ID and API key. Custom executable boundaries can use `client.lifecycle.run(context, execute, authorize)`, with a context from `client.lifecycle.createContext(...)`. Upgrade the assigned runtime alongside the SDK. Set `AGENTICDOME_EVIDENCE_ENABLED=false` to opt out. Explicit portal evidence credentials remain supported.
+
+The reporter sends bounded metadata and hashes, with `sdk_reported` assurance. It does not send raw arguments or results, and a policy lookup alone is not an execution outcome. The runtime persists accepted records in Redis and relays them to its owning control plane. Delivery failure never changes authorization. Inspect `client.lifecycle.stats()` for failures or dropped records and `await client.lifecycle.flush()` before exiting a short-lived process.
+
 ---
 
 ## Architecture & Responsibility Matrix
