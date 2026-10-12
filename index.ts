@@ -394,6 +394,40 @@ export class AgenticDomeHTTPError extends AgenticDomeError {
   }
 }
 
+const preparedApprovals = new WeakMap<ApprovalRequired, { json: string; tenantId?: TenantId }>();
+
+/** A paused exact action. Approval never executes it without an explicit resume. */
+export class ApprovalRequired extends AgenticDomeError {
+  readonly requestId: string;
+  readonly approvalUrl: string;
+  constructor(response: Dict, preparedRequest: Dict, tenantId?: TenantId) {
+    const context = response.context ?? {};
+    const requestId = String(context.approval?.id ?? '');
+    super(`Approval required${requestId ? `: ${requestId}` : ''}`);
+    this.name = 'ApprovalRequired';
+    this.requestId = requestId;
+    this.approvalUrl = String(context.approval_url ?? '');
+    preparedApprovals.set(this, { json: JSON.stringify(preparedRequest), tenantId });
+    Object.defineProperty(this, 'requestId', { writable: false });
+    Object.defineProperty(this, 'approvalUrl', { writable: false });
+  }
+  resume<T>(client: AgenticDomeClient, executor: (arguments_: Dict) => T | Promise<T>): Promise<T> {
+    return client.resumeApprovedAction(this, executor);
+  }
+  /** Contains original arguments: encrypt in host storage and never log it. */
+  exportPreparedAction(): Dict {
+    const prepared = preparedApprovals.get(this)!;
+    return { schema: 'agenticdome.sdk-prepared-approval.v1', approval: { id: this.requestId, url: this.approvalUrl },
+      prepared_request: JSON.parse(prepared.json), tenant_id: prepared.tenantId ?? null };
+  }
+  static restorePreparedAction(record: Dict): ApprovalRequired {
+    if (record?.schema !== 'agenticdome.sdk-prepared-approval.v1' || !record.prepared_request?.tool_name || !record.approval?.id) {
+      throw new AgenticDomeError('Invalid prepared approval record');
+    }
+    return new ApprovalRequired({ context: { approval: { id: record.approval.id }, approval_url: record.approval.url ?? '' } }, record.prepared_request, record.tenant_id ?? undefined);
+  }
+}
+
 export interface ToolProvenance {
   toolVersion?: string;
   toolDigest?: string;
@@ -1316,6 +1350,10 @@ export class AgenticDomeClient {
       content_parts: options.contentParts,
     });
 
+    if (options.toolName) {
+      payload.policy_context = { ...mergedPolicyContext, approval_action_id: mergedPolicyContext.approval_action_id ?? randomUUID() };
+    }
+
     if (options.toolDigest && !/^sha256:[0-9a-f]{64}$/.test(options.toolDigest)) {
       throw new Error("'toolDigest' must be sha256 followed by 64 lowercase hexadecimal characters");
     }
@@ -1361,10 +1399,14 @@ export class AgenticDomeClient {
       }
     }
     const policyManaged = brokerEnabled && resolvedBrokerMode === 'policy' && options.executionBroker !== true;
+    const preparedPayload = JSON.parse(JSON.stringify(payload));
     const response = await this.request('POST', policyManaged ? '/tools/execution/resolve' : brokerEnabled ? '/tools/execution/authorize' : '/tools/guardrail/validate', {
       tenantId: options.tenantId,
-      jsonBody: payload,
+      jsonBody: preparedPayload,
     });
+    if (String(response.verdict ?? '').toUpperCase() === 'APPROVAL_REQUIRED') {
+      throw new ApprovalRequired(response, preparedPayload, options.tenantId);
+    }
     if (brokerEnabled) {
       if (policyManaged) {
         const contract = response.execution_broker_policy || {};
@@ -1380,6 +1422,24 @@ export class AgenticDomeClient {
       }
     }
     return response;
+  }
+
+  async resumeApprovedAction<T>(pending: ApprovalRequired, executor: (arguments_: Dict) => T | Promise<T>): Promise<T> {
+    const prepared = preparedApprovals.get(pending);
+    if (!prepared || typeof executor !== 'function' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(pending.requestId)) {
+      throw new AgenticDomeError('A prepared approval request and executor are required');
+    }
+    const payload = JSON.parse(prepared.json);
+    const grant = await this.request('GET', `/tools/approvals/${pending.requestId}/grant`, { tenantId: prepared.tenantId });
+    if (typeof grant.approval_grant !== 'string' || !grant.approval_grant) throw new AgenticDomeError('No current approval grant was returned');
+    payload.policy_context = { ...(payload.policy_context ?? {}), approval_grant: grant.approval_grant };
+    payload.boundary_id ??= `sdk:approval:${pending.requestId}`;
+    const response = await this.request('POST', '/tools/execution/authorize', { tenantId: prepared.tenantId, jsonBody: payload });
+    const broker = response.broker ?? {};
+    if (response.verdict !== 'ALLOWED' || !broker.verified || !broker.token_consumed || broker.approval_request_id !== pending.requestId || !response.execution_receipt) {
+      throw new AgenticDomeError('The approved action could not be revalidated and consumed');
+    }
+    return executor(JSON.parse(prepared.json).tool_args);
   }
 
   async inspectContent(options: {

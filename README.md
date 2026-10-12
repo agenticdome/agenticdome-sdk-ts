@@ -1,5 +1,33 @@
 # AgenticDome SDK
 
+SDK 0.6.15 adds exact-action approval resumption. A scoped transfer may raise
+`ApprovalRequired`; preserve that object, review its `approvalUrl`, and resume
+after approval using the original prepared action:
+
+```ts
+import AgenticDomeClient, { ApprovalRequired } from 'agenticdome-sdk';
+
+try {
+  await client.guardrailValidate(action);
+} catch (error) {
+  if (!(error instanceof ApprovalRequired)) throw error;
+  await encryptedWorkflowStore.save(error.requestId, error.exportPreparedAction());
+  showApprovalLink(error.approvalUrl);
+}
+
+// In the host's explicit resume handler, after human review:
+const pending = ApprovalRequired.restorePreparedAction(await encryptedWorkflowStore.load(requestId));
+await pending.resume(client, exactArguments => executeTool(exactArguments));
+```
+
+The SDK does not approve requests or create Global Policy grants. Changed policy,
+payload, destination, expiry, revocation or replay prevents execution. Normal
+allowed actions perform no approval fetch. A workflow host must retain its
+prepared action; the SDK does not automatically checkpoint or resume every host.
+Prepared records contain original arguments: encrypt them, restrict access and
+never log or send them to the portal. Restoring a record does not authorize it;
+the broker still verifies every binding and consumes the grant once.
+
 [![npm version](https://img.shields.io/npm/v/agenticdome-sdk.svg)](https://www.npmjs.com/package/agenticdome-sdk)
 [![CI](https://github.com/agenticdome/agenticdome-sdk-ts/actions/workflows/ci.yml/badge.svg)](https://github.com/agenticdome/agenticdome-sdk-ts/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
