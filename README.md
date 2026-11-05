@@ -876,3 +876,19 @@ npm run build
 The TypeScript SDK client and its public documentation are open source under the [Apache License 2.0](https://github.com/agenticdome/agenticdome-sdk-ts/blob/main/LICENSE). Live policy enforcement requires an active AgenticDome tenant and assigned runtime service. The AgenticDome sidecar, management console, policy engine, threat intelligence, and server-side decision logic are separate proprietary products and are not licensed under this SDK repository's Apache-2.0 license. See [NOTICE](https://github.com/agenticdome/agenticdome-sdk-ts/blob/main/NOTICE) for the commercial service boundary.
 
 Contributions are welcome under [CONTRIBUTING.md](https://github.com/agenticdome/agenticdome-sdk-ts/blob/main/CONTRIBUTING.md). Use the public [issue tracker](https://github.com/agenticdome/agenticdome-sdk-ts/issues) for ordinary defects and questions. Report vulnerabilities privately as described in [SECURITY.md](https://github.com/agenticdome/agenticdome-sdk-ts/blob/main/SECURITY.md).
+## Exact HTTP execution
+
+`client.executeHttp({method, url, body, headers, agentId, toolName,
+requestPurpose})` authorizes and sends the same bounded UTF-8 request. It
+requires a compatible sidecar broker and refuses redirects. Catch
+`ApprovalRequired` to pause before sending, then call
+`client.resumeApprovedHttp(pending, headers)` after authenticated review. Fresh
+API authentication headers may be supplied; reviewed content and If-Match,
+If-None-Match or If-Unmodified-Since preconditions cannot change. Existing tool
+callbacks keep their contract. Network enforcement additionally requires a
+compatible enforcing gateway and controlled direct egress. The returned
+`Response` describes the provider outcome, separate from policy authorization.
+
+### Shared resource adapters and GraphQL
+
+`OwnershipGuard` verifies tenant, resource identity, ownership or explicit entitlements and permitted operations through trusted provider callbacks. Attach it to the client or MCP gateway; HTTP approval resume rechecks current facts. `executeGraphql` sends exact prepared JSON through the interpreting sidecar. GraphQL rules use `tool#Mutation.field` and resolved field arguments, never an asserted owner or unused variable. See [resource adapter examples](docs/resource-adapters.md).

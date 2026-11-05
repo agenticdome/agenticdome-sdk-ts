@@ -55,7 +55,7 @@ const client = new AgenticDomeClient(process.env.AGENTICDOME_API_BASE!, {
 const gateway = new AgenticDomeMCPGateway(
   client,
   async (request) => existingMcpTransport.send(request),
-  { failClosed: true, sanitizeOutput: true },
+  { failClosed: true, sanitizeOutput: true, requireMcpSchema: true },
 );
 
 const response = await gateway.forward(request, {
@@ -78,6 +78,32 @@ unwrapped routes, disabled review and explicitly fail-open review are outside
 this coverage.
 Runtime-reported partial scan or echo coverage blocks the response, as does a
 large response lacking explicit no-truncation evidence from an older sidecar.
+
+Fetch the server's `tools/list` through this same gateway before calling tools.
+The gateway caches published `inputSchema` definitions for at most five minutes,
+separately for each tenant, server, session, caller and scoped identity. Valid
+cached calls require no extra catalogue request. It checks required fields,
+types, enum values, numeric bounds, nested structures and additional properties
+before policy authorization, then checks sanitized arguments again. Schema
+changes during authorization require a new discovery/retry. A completed new
+catalogue removes omitted tools. Paginated catalogues reject repeated tool names
+and remain bounded. When the transport receives `notifications/tools/list_changed`,
+call `gateway.invalidateSchemas(context)` and fetch the catalogue again.
+
+`requireMcpSchema` defaults to false for existing integrations, matching Python's
+compatibility behavior. Published schemas are still checked whenever available;
+new integrations should enable it so missing or expired schemas block forwarding.
+Schema errors cannot be made fail-open. Local acyclic references and draft-07,
+2019-09 and 2020-12 schemas are supported. Remote schema loading, dynamic
+references, schema resource IDs and unsupported regex constructs fail closed.
+Regex checks use a bounded, non-backtracking engine. Schema and argument size,
+depth, catalogue and cache-memory limits apply. Schema validity describes the
+request structure; the runtime's policies and identity checks decide authority.
+
+The client also exposes `guardNativeTool(event)` and `nativeGuardReady()` for
+Docker mandatory-guard integration, using the same endpoint and event shape as
+Python. These checks never execute a tool or cache a permit, and refuse redirects.
+The Python `agenticdome-docker-guard` CLI remains the ready-made Docker hook adapter.
 
 The lower-level policy methods remain available for bespoke transports, but
 calling `mcpGuardrailValidate()` and scanning only `content[].text` is **not**

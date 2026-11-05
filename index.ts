@@ -4,6 +4,8 @@ import axios, {
   Method,
 } from 'axios';
 import { promises as fs } from 'node:fs';
+import { readFileSync } from 'node:fs';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import {
   createHash,
   createPrivateKey,
@@ -16,6 +18,11 @@ import {
 import http from 'node:http';
 import https from 'node:https';
 import packageMetadata from './package.json';
+import { OwnershipGuard } from './ownership';
+import { McpSchemaCache, McpSchemaError, McpSchemaUnavailable, bounded as assertBoundedJson } from './mcp-schema';
+export { McpSchemaCache, McpSchemaError, McpSchemaUnavailable } from './mcp-schema';
+export { OwnershipGuard, OwnershipDenied, verifyResourceFact } from './ownership';
+export type { ResourceRule, ResourceSubject, ResourceRequest, ResourceFact } from './ownership';
 
 type TenantId = string | number;
 type Dict = Record<string, any>;
@@ -437,6 +444,7 @@ export interface ToolProvenance {
 }
 
 export interface AgenticDomeClientOptions {
+  ownershipGuard?: OwnershipGuard;
   apiKey?: string;
   tenantId?: TenantId;
   bearerToken?: string;
@@ -455,6 +463,7 @@ interface RequestOptions {
   extraHeaders?: Record<string, string>;
   timeout?: number; // seconds
   contentType?: string;
+  allowRedirects?: boolean;
 }
 
 export interface ScanOptions {
@@ -496,6 +505,7 @@ export interface GuardrailValidateOptions {
   executionBoundaryId?: string;
   executionDestination?: string;
   executionHttpMethod?: string;
+  executionRequest?: { body_base64: string; headers: Record<string, string> };
   workloadId?: string;
   workloadUuid?: string;
   contentParts?: Array<{
@@ -669,6 +679,10 @@ export interface ScenarioOptions {
 }
 
 export class AgenticDomeClient {
+  get configuredTenantId(): string | undefined { return this.tenantId; }
+  /** Opaque cache partition; never returns identity tokens or API credentials. */
+  get identityCacheScope(): string { return sha256(this.headers()); }
+  private readonly ownershipGuard?: OwnershipGuard;
   readonly lifecycle: VerifiedActionReporter;
   private readonly apiBase: string;
   private readonly apiKey: string;
@@ -685,6 +699,7 @@ export class AgenticDomeClient {
   private readonly httpsAgent: https.Agent;
 
   constructor(apiBase = process.env.AGENTICDOME_API_BASE || '', options: AgenticDomeClientOptions = {}) {
+    this.ownershipGuard = options.ownershipGuard;
     this.apiBase = this.requireNonempty('apiBase', apiBase).replace(/\/+$/, '');
     this.apiKey = options.apiKey || process.env.AGENTICDOME_API_KEY || '';
     this.tenantId =
@@ -777,7 +792,80 @@ export class AgenticDomeClient {
       Object.assign(headers, extraHeaders);
     }
 
+    const identityHeaders: [string,string][] = [
+      ['AGENTICDOME_AGENT_CREDENTIAL','X-AgenticDome-Agent-Credential'],['AGENTICDOME_IDENTITY_DEPLOYMENT','X-AgenticDome-Deployment'],
+      ['AGENTICDOME_AGENT_ID','X-AgenticDome-Agent-Id'],['AGENTICDOME_AGENT_FRAMEWORK','X-AgenticDome-Agent-Framework'],
+      ['AGENTICDOME_AGENT_TOKEN','X-AgenticDome-Agent-Token'],['AGENTICDOME_WORKLOAD_TOKEN','X-AgenticDome-Workload-Token'],
+      ['AGENTICDOME_USER_TOKEN','X-AgenticDome-User-Token'],['AGENTICDOME_DELEGATION_TOKEN','X-AgenticDome-Delegation-Token'],['AGENTICDOME_TASK_ID','X-AgenticDome-Task-Id']];
+    for(const [name,header] of identityHeaders){
+      let value=String(process.env[name]||'').trim();const filename=String(process.env[name+'_FILE']||'').trim();
+      if(value&&filename)throw new Error('Configure one identity value or file for '+name);
+      if(filename){const raw=readFileSync(filename);if(raw.length>16384)throw new Error('Identity proof exceeds the size limit');value=raw.toString('utf8').trim();if(!value)throw new Error('Identity proof file is empty');}
+      if(value.length>16384||/[\u0000-\u001f\u007f]/.test(value))throw new Error('Identity header contains an invalid value');
+      if(value&&headers[header]===undefined)headers[header]=value;
+    }
+    for(const [header,value]of Object.entries(this.identityScope.getStore()||{})){
+      if(extraHeaders&&header in extraHeaders)continue;if(value===null)delete headers[header];else headers[header]=value;
+    }
+    if(headers['X-AgenticDome-Agent-Token']){delete headers['X-AgenticDome-Agent-Credential'];delete headers['X-AgenticDome-Workload-Token'];}
+
     return headers;
+  }
+
+  async enrolIdentity(agentId: string, framework='application'): Promise<Dict> {
+    return this.request('POST','/identity/v1/enrol',{jsonBody:{agent_id:agentId,framework}});
+  }
+
+  async delegateIdentity(recipientAgentId: string, taskId: string, subjectToken?: string): Promise<Dict> {
+    return this.request('POST','/identity/v1/delegate',{jsonBody:{recipient_agent_id:recipientAgentId,task_id:taskId,scope:'identity:act',...(subjectToken?{subject_token:subjectToken}:{})}});
+  }
+
+  async exchangeIdentity(subjectToken: string, audience: string, taskId: string, scope: string): Promise<Dict> {
+    return this.request('POST','/identity/v1/token',{jsonBody:{grant_type:'urn:ietf:params:oauth:grant-type:token-exchange',subject_token:subjectToken,subject_token_type:'urn:ietf:params:oauth:token-type:access_token',audience,task_id:taskId,scope}});
+  }
+
+  private managedTokens = new Map<string,{token:string;expires:number}>();
+  private managedPending = new Map<string,Promise<{token:string;expires:number}>>();
+  private identityScope=new AsyncLocalStorage<Record<string,string|null>>();
+  withIdentity<T>(identity:{userToken?:string;delegationToken?:string;taskId?:string},run:()=>T):T {
+    if(identity.userToken&&identity.delegationToken)throw new AgenticDomeError('Use a user token or a delegation token, not both');
+    if(identity.delegationToken&&!identity.taskId)throw new AgenticDomeError('A delegation token requires its task ID');
+    const headers={...(this.identityScope.getStore()||{})};
+    if(identity.userToken||identity.delegationToken){headers['X-AgenticDome-User-Token']=null;headers['X-AgenticDome-Delegation-Token']=null;}
+    const fields:[string|undefined,string,number][]=[[identity.userToken,'X-AgenticDome-User-Token',16384],[identity.delegationToken,'X-AgenticDome-Delegation-Token',16384],[identity.taskId,'X-AgenticDome-Task-Id',256]];
+    for(const [value,header,limit]of fields)if(value!==undefined){if(typeof value!=='string'||!value.trim()||value.length>limit||/[\u0000-\u001f\u007f]/.test(value))throw new AgenticDomeError('Invalid scoped identity value');headers[header]=value.trim();}
+    return this.identityScope.run(headers,run);
+  }
+  private async managedHeaders(path: string, options: RequestOptions, original: Record<string,string>): Promise<Record<string,string>> {
+    if(!['/tools/','/a2a','/mcp'].some(prefix=>path.startsWith(prefix)))return original;
+    if(!(original['X-AgenticDome-Deployment']||original['X-AgenticDome-Agent-Token'])){if(original['X-AgenticDome-User-Token']||original['X-AgenticDome-Delegation-Token'])throw new AgenticDomeError('Configure deployment proof or an enrolled agent token before supplying delegated identity');return original;}
+    let body=options.jsonBody||{};const params=body.params&&typeof body.params==='object'?body.params:{};
+    if(params.arguments&&typeof params.arguments==='object')body=params.arguments;else if(params.agent_id)body=params;
+    const context=body.policy_context&&typeof body.policy_context==='object'?body.policy_context:{};
+    const native=body.agent_id||original['X-AgenticDome-Agent-Id']||'application';
+    const framework=context.platform||body.platform||original['X-AgenticDome-Agent-Framework']||'gateway';
+    const explicit=original['X-AgenticDome-Agent-Token'];const proof=explicit||original['X-AgenticDome-Agent-Credential']||original['X-AgenticDome-Workload-Token']||'';
+    const key=createHash('sha256').update(JSON.stringify([original['X-Tenant-Id'],original['X-AgenticDome-Deployment'],native,framework,proof])).digest('hex');
+    let cached=this.managedTokens.get(key);
+    if(!cached||cached.expires<=Date.now()+30000){
+      let pending=this.managedPending.get(key);
+      if(!pending){
+        pending=(async()=>{
+          const clean=Object.fromEntries(Object.entries(original).filter(([name])=>!['x-agenticdome-user-token','x-agenticdome-delegation-token','x-agenticdome-task-id'].includes(name.toLowerCase())));
+          const response=await this.api.request({method:'POST',url:explicit?'/identity/v1/introspect':'/identity/v1/enrol',headers:clean,data:explicit?{token:explicit}:{agent_id:native,framework},timeout:this.timeout*1000,validateStatus:()=>true});
+          if(response.status<200||response.status>=300)throw new AgenticDomeError('Managed identity could not be verified. Check deployment approval and update the assigned sidecar.');
+          const issued=response.data||{};
+          if(explicit&&(issued.active!==true||issued.token_use!=='agent_identity'))throw new AgenticDomeError('Managed agent token is not active');
+          const token=explicit||issued.access_token,expires=explicit?Number(issued.exp)*1000:Date.now()+Math.min(Number(issued.expires_in||0),3600)*1000;
+          if(typeof token!=='string'||!token||!Number.isFinite(expires)||expires<=Date.now()||expires>Date.now()+3601000)throw new AgenticDomeError('Runtime returned an invalid managed identity response');
+          if(this.managedTokens.size>=1000){for(const [id,value]of this.managedTokens)if(value.expires<=Date.now()+30000)this.managedTokens.delete(id);if(this.managedTokens.size>=1000)this.managedTokens.delete(this.managedTokens.keys().next().value!);}
+          const result={token,expires};this.managedTokens.set(key,result);return result;
+        })();
+        this.managedPending.set(key,pending);
+      }
+      try{cached=await pending;}finally{this.managedPending.delete(key);}
+    }
+    const headers={...original};delete headers['X-AgenticDome-Agent-Credential'];delete headers['X-AgenticDome-Workload-Token'];headers['X-AgenticDome-Agent-Token']=cached.token;return headers;
   }
 
   private requireNonempty(name: string, value: unknown): string {
@@ -1013,12 +1101,12 @@ export class AgenticDomeClient {
   ): Promise<Dict> {
     const url = `${this.apiBase}${path}`;
 
-    const headers = this.headers({
+    const headers = await this.managedHeaders(path,options,this.headers({
       contentType: options.contentType,
       tenantId: options.tenantId,
       useBearer: options.useBearer,
       extraHeaders: options.extraHeaders,
-    });
+    }));
 
     const config: AxiosRequestConfig = {
       method,
@@ -1027,6 +1115,7 @@ export class AgenticDomeClient {
       data: options.jsonBody,
       timeout: (options.timeout ?? this.timeout) * 1000,
       validateStatus: () => true,
+      ...(options.allowRedirects === false ? { maxRedirects: 0 } : {}),
     };
 
     const attempts = this.maxRetries + 1;
@@ -1035,6 +1124,7 @@ export class AgenticDomeClient {
     for (let attempt = 1; attempt <= attempts; attempt++) {
       try {
         const response = await this.api.request(config);
+        if (options.allowRedirects === false && response.status >= 300 && response.status < 400) throw new AgenticDomeHTTPError(response.status, 'Gateway redirects are not allowed', '');
 
         if (response.status >= 200 && response.status < 300) {
           if (
@@ -1399,6 +1489,10 @@ export class AgenticDomeClient {
       }
     }
     const policyManaged = brokerEnabled && resolvedBrokerMode === 'policy' && options.executionBroker !== true;
+    if (options.executionRequest !== undefined) {
+      if (!brokerEnabled) throw new AgenticDomeError('Prepared HTTP execution requires the execution broker');
+      payload.execution_request = options.executionRequest;
+    }
     const preparedPayload = JSON.parse(JSON.stringify(payload));
     const response = await this.request('POST', policyManaged ? '/tools/execution/resolve' : brokerEnabled ? '/tools/execution/authorize' : '/tools/guardrail/validate', {
       tenantId: options.tenantId,
@@ -1424,13 +1518,17 @@ export class AgenticDomeClient {
     return response;
   }
 
-  async resumeApprovedAction<T>(pending: ApprovalRequired, executor: (arguments_: Dict) => T | Promise<T>): Promise<T> {
+  async resumeApprovedAction<T>(pending: ApprovalRequired, executor: (arguments_: Dict, authorization: Dict) => T | Promise<T>): Promise<T> {
     const prepared = preparedApprovals.get(pending);
     if (!prepared || typeof executor !== 'function' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(pending.requestId)) {
       throw new AgenticDomeError('A prepared approval request and executor are required');
     }
     const payload = JSON.parse(prepared.json);
-    const grant = await this.request('GET', `/tools/approvals/${pending.requestId}/grant`, { tenantId: prepared.tenantId });
+    const grantOptions: RequestOptions={tenantId:prepared.tenantId};
+    if(process.env.AGENTICDOME_IDENTITY_DEPLOYMENT||process.env.AGENTICDOME_AGENT_TOKEN||process.env.AGENTICDOME_AGENT_TOKEN_FILE){
+      grantOptions.extraHeaders={'X-AgenticDome-Agent-Id':payload.agent_id||'application','X-AgenticDome-Agent-Framework':payload.policy_context?.platform||'gateway'};
+    }
+    const grant = await this.request('GET', `/tools/approvals/${pending.requestId}/grant`, grantOptions);
     if (typeof grant.approval_grant !== 'string' || !grant.approval_grant) throw new AgenticDomeError('No current approval grant was returned');
     payload.policy_context = { ...(payload.policy_context ?? {}), approval_grant: grant.approval_grant };
     payload.boundary_id ??= `sdk:approval:${pending.requestId}`;
@@ -1439,7 +1537,77 @@ export class AgenticDomeClient {
     if (response.verdict !== 'ALLOWED' || !broker.verified || !broker.token_consumed || broker.approval_request_id !== pending.requestId || !response.execution_receipt) {
       throw new AgenticDomeError('The approved action could not be revalidated and consumed');
     }
-    return executor(JSON.parse(prepared.json).tool_args);
+    return executor(JSON.parse(prepared.json).tool_args, response);
+  }
+
+  private prepareHttp(method: string, url: string, body: string, headers: Record<string, string> = {}) {
+    const target = new URL(url);
+    method = method.toUpperCase();
+    if (!['http:', 'https:'].includes(target.protocol) || target.username || target.password || target.hash || !['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'].includes(method)) {
+      throw new AgenticDomeError('Use an absolute HTTP(S) URL without credentials/fragment and a supported method');
+    }
+    if (Buffer.byteLength(body, 'utf8') > 131072 || (['GET', 'HEAD'].includes(method) && body)) throw new AgenticDomeError('Unsupported HTTP body size or method');
+    const bound: Record<string, string> = {};
+    const all: Record<string, string> = {};
+    for (const [key, value] of Object.entries(headers)) {
+      const name = key.toLowerCase();
+      if (name in all || ['host', 'content-length', 'transfer-encoding', 'content-encoding'].includes(name) || name.startsWith('x-agenticdome-')) throw new AgenticDomeError('Transport and AgenticDome headers are managed by the SDK');
+      all[name] = value;
+      if (['content-type', 'if-match', 'if-none-match', 'if-unmodified-since'].includes(name)) bound[name] = value;
+    }
+    const args = { method, url: target.href, body: body ? (bound['content-type']?.toLowerCase().includes('json') ? JSON.parse(body) : body) : null, headers: bound };
+    return { args, descriptor: { body_base64: Buffer.from(body, 'utf8').toString('base64'), headers: bound }, headers: all, body };
+  }
+
+  private async sendPreparedHttp(prepared: ReturnType<AgenticDomeClient['prepareHttp']>, authorization: Dict, workloadId?: string, timeoutMs = 30000, toolName = '', requireGraphql?: string): Promise<Response> {
+    if (authorization.verdict !== 'ALLOWED' || !authorization.broker?.verified || !authorization.broker?.token_consumed || authorization.enforcement_evidence?.http_request_bound !== true) {
+      throw new AgenticDomeError('Exact HTTP execution requires a compatible enforcing broker receipt');
+    }
+    if (requireGraphql && authorization.enforcement_evidence?.graphql_interpretation !== requireGraphql) throw new AgenticDomeError('GraphQL execution requires a compatible interpreting sidecar');
+    if (this.ownershipGuard) {
+      if (!this.tenantId) throw new AgenticDomeError('Configure the enforcement tenant when using resource ownership adapters');
+      await this.ownershipGuard.checkHttp(toolName, prepared.args, authorization.enforcement_evidence, this.tenantId);
+    }
+    const response = await fetch(prepared.args.url, { method: prepared.args.method,
+      headers: { ...prepared.headers, ...this.enforcementHeaders(authorization, workloadId) },
+      body: prepared.body ? new Uint8Array(Buffer.from(prepared.body, 'utf8')) : undefined,
+      redirect: 'manual', signal: AbortSignal.timeout(timeoutMs) });
+    if (response.status >= 300 && response.status < 400) {
+      await response.body?.cancel();
+      throw new AgenticDomeError('Redirect refused; authorize its destination as a new action');
+    }
+    return response;
+  }
+
+  async executeHttp(options: Omit<GuardrailValidateOptions, 'text' | 'toolArgs' | 'executionRequest'> & { toolName: string; url: string; method: string; body?: string; headers?: Record<string, string>; timeoutMs?: number }): Promise<Response> {
+    const { url, method, body = '', headers = {}, timeoutMs, ...context } = options;
+    const prepared = this.prepareHttp(method, url, body, headers);
+    const result = await this.guardrailValidate({ ...context, text: 'Execute reviewed HTTP operation',
+      platform: context.platform ?? 'generic', toolArgs: prepared.args, executionBroker: true,
+      executionDestination: prepared.args.url, executionHttpMethod: prepared.args.method, executionRequest: prepared.descriptor });
+    return this.sendPreparedHttp(prepared, result, context.workloadId, timeoutMs, context.toolName, context.policyContext?.required_graphql_schema);
+  }
+
+  async executeGraphql(options: Omit<Parameters<AgenticDomeClient['executeHttp']>[0], 'method' | 'body'> & { query: string; variables?: Dict; operationName?: string }): Promise<Response> {
+    const { query, variables = {}, operationName, headers = {}, ...context } = options;
+    if (typeof query !== 'string' || !query.trim() || !variables || typeof variables !== 'object' || Array.isArray(variables)) throw new AgenticDomeError('Supply a complete GraphQL document and variable object');
+    if (Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) throw new AgenticDomeError('GraphQL content type is managed by the SDK');
+    return this.executeHttp({ ...context, method: 'POST', body: JSON.stringify({ query, variables, ...(operationName === undefined ? {} : { operationName }) }),
+      headers: { ...headers, 'content-type': 'application/json' }, policyContext: { ...context.policyContext, required_graphql_schema: 'agenticdome.graphql-actions.v1' } });
+  }
+
+  async resumeApprovedHttp(pending: ApprovalRequired, headers: Record<string, string> = {}, timeoutMs = 30000): Promise<Response> {
+    const frozen = preparedApprovals.get(pending);
+    if (!frozen) throw new AgenticDomeError('A prepared HTTP approval is required');
+    const payload = JSON.parse(frozen.json);
+    if (!payload.execution_request || Object.keys(headers).some(k => ['content-type', 'if-match', 'if-none-match', 'if-unmodified-since'].includes(k.toLowerCase()))) throw new AgenticDomeError('Approved content and preconditions cannot be changed');
+    const prepared = this.prepareHttp(payload.http_method, payload.destination, Buffer.from(payload.execution_request.body_base64, 'base64').toString('utf8'), { ...headers, ...payload.execution_request.headers });
+    if (JSON.stringify(prepared.descriptor) !== JSON.stringify(payload.execution_request) || JSON.stringify(prepared.args) !== JSON.stringify(payload.tool_args)) {
+      throw new AgenticDomeError('The saved HTTP request does not match its prepared bytes and arguments');
+    }
+    // The sidecar revalidates the frozen arguments and exact descriptor before
+    // consuming approval; only then can this continuation send those bytes.
+    return this.resumeApprovedAction(pending, (_args, result) => this.sendPreparedHttp(prepared, result, payload.workload_id, timeoutMs, payload.tool_name, payload.policy_context?.required_graphql_schema));
   }
 
   async inspectContent(options: {
@@ -1504,6 +1672,19 @@ export class AgenticDomeClient {
   async getRuntimeReadiness(): Promise<Dict> {
     return this.request("GET", "/health/readiness");
   }
+
+  /** Check one Docker mandatory guard event. Never executes or caches permits. */
+  async guardNativeTool(event: Dict): Promise<Dict> {
+    assertBoundedJson(event);
+    if (event.hook_event_name !== 'tool_guard' || !event.tool_input || typeof event.tool_input !== 'object' || Array.isArray(event.tool_input)
+      || ['agent_name', 'tool_name', 'session_id', 'tool_use_id'].some(key => typeof event[key] !== 'string' || !event[key])) throw new AgenticDomeError('Expected a complete Docker tool_guard event');
+    const defaults: Dict = { hook_event_name: '', agent_name: '', tool_name: '', tool_input: null, session_id: '', tool_use_id: '', tool_category: 'unknown', cwd: '' };
+    const payload = Object.fromEntries(Object.entries(defaults).map(([key, value]) => [key, event[key] === undefined ? value : event[key]]));
+    const raw = JSON.stringify(payload); if (Buffer.byteLength(raw) > 131072) throw new AgenticDomeError('Tool input exceeds limit');
+    return this.request('POST', '/gateway/v1/guard', { jsonBody: JSON.parse(raw), allowRedirects: false });
+  }
+
+  async nativeGuardReady(): Promise<Dict> { return this.request('GET', '/gateway/v1/guard/ready', { allowRedirects: false }); }
 
   async guardrailCheck(
     text: string,
@@ -2157,6 +2338,7 @@ export interface MCPGatewayContext {
   mcpServerTrustLevel?: string;
   policyContext?: Dict;
   tenantId?: TenantId;
+  serverAuthorizationScope?: string;
 }
 
 export type MCPGatewayForwarder = (
@@ -2165,9 +2347,12 @@ export type MCPGatewayForwarder = (
 ) => Promise<MCPJsonRpcResponse> | MCPJsonRpcResponse;
 
 export interface MCPGatewayOptions {
+  ownershipGuard?: OwnershipGuard;
   failClosed?: boolean;
   sanitizeOutput?: boolean;
   authorizeUnknownMethods?: boolean;
+  requireMcpSchema?: boolean;
+  schemaCache?: McpSchemaCache;
   providerActionRules?: Record<string, MCPProviderActionRule>;
   resolveProviderFacts?: (toolName: string, finalArguments: Dict) => Promise<MCPProviderActionFacts> | MCPProviderActionFacts;
 }
@@ -2190,6 +2375,10 @@ export interface MCPProviderActionFacts {
 
 /** Transport-neutral MCP request/response gateway for an existing transport. */
 export class AgenticDomeMCPGateway {
+  readonly mcpSchemas: McpSchemaCache;
+  private readonly requireMcpSchema: boolean;
+  private readonly schemaPages = new Map<string, { expires: number; names: Set<string> }>();
+  private readonly ownershipGuard?: OwnershipGuard;
   private readonly failClosed: boolean;
   private readonly sanitizeOutput: boolean;
   private readonly authorizeUnknownMethods: boolean;
@@ -2202,10 +2391,52 @@ export class AgenticDomeMCPGateway {
     options: MCPGatewayOptions = {},
   ) {
     this.failClosed = options.failClosed ?? true;
+    this.ownershipGuard = options.ownershipGuard;
     this.sanitizeOutput = options.sanitizeOutput ?? true;
     this.authorizeUnknownMethods = options.authorizeUnknownMethods ?? true;
     this.providerActionRules = options.providerActionRules ?? {};
     this.resolveProviderFacts = options.resolveProviderFacts;
+    this.requireMcpSchema = options.requireMcpSchema ?? false;
+    this.mcpSchemas = options.schemaCache ?? new McpSchemaCache();
+  }
+
+  private schemaScope(context: MCPGatewayContext): string {
+    try { return JSON.stringify([context.tenantId ?? this.client.configuredTenantId, context.mcpServerId, context.mcpServerUrl,
+      context.sessionId, context.userId, context.agentId, context.serverAuthorizationScope, this.client.identityCacheScope]); }
+    catch { throw new McpSchemaError('MCP schema caller scope is unavailable'); }
+  }
+
+  /** Call when the transport receives notifications/tools/list_changed. */
+  invalidateSchemas(context?: MCPGatewayContext): void {
+    if (context) { const scope = this.schemaScope(context); this.mcpSchemas.invalidate(scope); this.schemaPages.delete(scope); }
+    else { this.mcpSchemas.invalidate(); this.schemaPages.clear(); }
+  }
+
+  private validateInput(request: MCPJsonRpcRequest, context: MCPGatewayContext, expectedDigest?: string): string | undefined {
+    if (request.method !== 'tools/call') return;
+    const params = request.params;
+    if (!params || typeof params !== 'object' || Array.isArray(params) || typeof params.name !== 'string' || !params.name.trim()
+      || (params.arguments !== undefined && (!params.arguments || typeof params.arguments !== 'object' || Array.isArray(params.arguments)))) throw new McpSchemaError('Invalid MCP tool call');
+    const scope = this.schemaScope(context);
+    if (this.mcpSchemas.available(scope, params.name)) return this.mcpSchemas.validate(scope, params.name, params.arguments ?? {}, expectedDigest);
+    if (this.requireMcpSchema || expectedDigest) throw new McpSchemaUnavailable('Fetch this server’s tools/list catalogue before authorizing a tool call');
+  }
+
+  private rememberSchemas(request: MCPJsonRpcRequest, response: MCPJsonRpcResponse, context: MCPGatewayContext): void {
+    if (request.method === 'notifications/tools/list_changed') { const scope = this.schemaScope(context); this.mcpSchemas.invalidate(scope); this.schemaPages.delete(scope); return; }
+    if (request.method !== 'tools/list' || response.error) return;
+    const result = response.result as Dict;
+    if (!result || !Array.isArray(result.tools) || result.tools.length > 256) throw new McpSchemaError('Invalid or oversized MCP tool catalogue');
+    const tools = result.tools.filter((tool: Dict) => tool && Object.prototype.hasOwnProperty.call(tool, 'inputSchema'));
+    if (this.requireMcpSchema && tools.length !== result.tools.length) throw new McpSchemaError('MCP tool definition omitted inputSchema');
+    const scope = this.schemaScope(context), prior = request.params?.cursor ? this.schemaPages.get(scope) : undefined;
+    if (request.params?.cursor && (!prior || prior.expires <= performance.now())) throw new McpSchemaError('Restart the expired MCP catalogue from its first page');
+    const names = new Set(prior?.names ?? []);
+    for (const tool of tools) { if (names.has(tool.name)) throw new McpSchemaError('MCP catalogue repeated a tool across pages'); names.add(tool.name); }
+    if (names.size > 256 || [...names].reduce((n, name) => n + String(name).length, 0) > 32768) throw new McpSchemaError('MCP catalogue exceeds tool limit');
+    this.mcpSchemas.install(scope, tools);
+    if (result.nextCursor) { if (this.schemaPages.size >= 32) this.schemaPages.delete(this.schemaPages.keys().next().value!); this.schemaPages.set(scope, { expires: performance.now() + this.mcpSchemas.ttlMs, names }); }
+    else { this.schemaPages.delete(scope); this.mcpSchemas.retainNames(scope, names); }
   }
 
   private requireContext(context: MCPGatewayContext): void {
@@ -2382,7 +2613,7 @@ export class AgenticDomeMCPGateway {
     context: MCPGatewayContext,
   ): Promise<{ request?: MCPJsonRpcRequest; decision?: Dict; blocked?: MCPJsonRpcResponse }> {
     this.requireContext(context);
-    if (!request || request.jsonrpc !== '2.0' || !String(request.method ?? '').trim()
+    if (!request || request.jsonrpc !== '2.0' || typeof request.method !== 'string' || !request.method.trim()
       || (request.id !== undefined && !this.validJsonRpcId(request.id))) {
       return { blocked: this.error(request, 'Invalid JSON-RPC request') };
     }
@@ -2394,6 +2625,11 @@ export class AgenticDomeMCPGateway {
     }
 
     try {
+      assertBoundedJson(request);
+      if (!this.plainJson(request)) throw new McpSchemaError('MCP requires plain JSON input');
+      request = JSON.parse(JSON.stringify(request));
+      context = structuredClone(context);
+      const schemaDigest = this.validateInput(request, context);
       const tool = this.toolDetails(request);
       const decision = await this.client.mcpGuardrailValidate({
         text: context.userPrompt || context.requestText || request.method,
@@ -2421,14 +2657,25 @@ export class AgenticDomeMCPGateway {
           return { blocked: this.error(request, 'REDACTED decision has no usable replacement arguments', { verdict }) };
         }
       }
-      const finalRequest = this.sanitizedRequest(request, decision);
+      const finalRequest = JSON.parse(JSON.stringify(this.sanitizedRequest(request, decision)));
+      this.validateInput(finalRequest, context, schemaDigest);
       if (!(await this.providerActionAllowed(finalRequest))) {
         return { blocked: this.error(request, 'Provider-backed booking authorization failed') };
       }
+      if (['tools/call', 'resources/read', 'prompts/get'].includes(finalRequest.method) && this.ownershipGuard) {
+        const finalTool = this.toolDetails(finalRequest);
+        const tenant = context.tenantId !== undefined ? String(context.tenantId) : this.client.configuredTenantId;
+        if (!tenant) throw new AgenticDomeError('Configure the enforcement tenant when using resource ownership adapters');
+        await this.ownershipGuard.check(finalTool.name, finalTool.args, tenant);
+      }
       return { request: finalRequest, decision };
     } catch (error) {
-      if (request.method === 'tools/call' && this.providerActionRules[this.toolDetails(request).name]) {
-        return { blocked: this.error(request, 'Provider-backed booking authorization unavailable') };
+      if (error instanceof McpSchemaError) return { blocked: this.error(request, error.message, { stage: 'input_schema' }) };
+      if (['resources/read', 'prompts/get'].includes(request.method) && this.ownershipGuard?.protects(this.toolDetails(request).name)) {
+        return { blocked: this.error(request, 'Provider resource authorization unavailable') };
+      }
+      if (request.method === 'tools/call' && (this.providerActionRules[this.toolDetails(request).name] || this.ownershipGuard?.protects(this.toolDetails(request).name))) {
+        return { blocked: this.error(request, 'Provider resource authorization unavailable') };
       }
       if (!this.failClosed) return { request };
       return { blocked: this.error(request, 'MCP preflight unavailable') };
@@ -2494,7 +2741,7 @@ export class AgenticDomeMCPGateway {
     if (request.method === 'tools/list' && preflight.decision) {
       response = this.filterTools(response, preflight.decision);
     }
-    if (!this.sanitizeOutput) return response;
+    if (!this.sanitizeOutput) { try { this.rememberSchemas(request, response, context); } catch { this.mcpSchemas.invalidate(this.schemaScope(context)); return this.error(request, 'MCP catalogue schema validation failed', { stage: 'input_schema' }); } return response; }
 
     const payload: Dict = { ...response };
     delete payload.jsonrpc;
@@ -2554,10 +2801,14 @@ export class AgenticDomeMCPGateway {
         if ((parsed as Dict).id !== response.id) {
           return this.error(request, 'REDACTED output changed the JSON-RPC request ID', { verdict, stage: 'output' });
         }
-        return { ...response, ...(parsed as Dict) };
+        const safeResponse = { ...response, ...(parsed as Dict) };
+        this.rememberSchemas(request, safeResponse, context);
+        return safeResponse;
       }
+      this.rememberSchemas(request, response, context);
       return response;
     } catch (error) {
+      if (error instanceof McpSchemaError) { this.mcpSchemas.invalidate(this.schemaScope(context)); return this.error(request, 'MCP catalogue schema validation failed', { stage: 'input_schema' }); }
       if (!this.failClosed) return response;
       return this.error(request, 'MCP output review failed');
     }
